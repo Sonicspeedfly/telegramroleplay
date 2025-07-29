@@ -452,7 +452,12 @@ class SimpleTelegramBot:
                 'last_activity': datetime.now(),
                 'creating_new_game': False,
                 'new_game_data': {},
-                'character_creation_step': 0
+                'character_creation_step': 0,
+                # Система для разбитых сообщений
+                'message_buffer': [],
+                'last_message_time': None,
+                'waiting_for_complete_message': False,
+                'message_timeout': 10  # секунд для ожидания продолжения
             }
         return self.user_sessions[user_id]
 
@@ -580,30 +585,71 @@ class SimpleTelegramBot:
         
         return parts
     
-    def generate_with_files(self, prompt: str, file_uris: List[str]) -> str:
+    def generate_with_files(self, prompt: str, file_uris: List[str], chat_id: int = None, progress_message_id: int = None) -> str:
         """Генерация ответа с подключенными файлами"""
+        start_time = datetime.now()
         self.increment_counter('total_requests')
         
         try:
+            # Отправляем начальный прогресс
+            if chat_id:
+                self.send_progress_message(chat_id, progress_message_id, 10, "📡 Подключение к Gemini API...")
+            
             # Создаем части для контента
             parts = [{"text": prompt}]
+            
             # Добавляем файлы
-            for file_uri in file_uris:
+            for i, file_uri in enumerate(file_uris):
                 parts.append({
                     "file_data": {
                         "file_uri": file_uri
                     }
                 })
+                
+                # Обновляем прогресс при обработке файлов
+                if chat_id:
+                    file_progress = 20 + (i + 1) * 20 // len(file_uris)
+                    self.send_progress_message(chat_id, progress_message_id, file_progress, f"📁 Обработка файла {i+1}/{len(file_uris)}...")
+            
             # Создаем контент
             contents = [{"parts": parts}]
+            
+            # Обновляем прогресс перед отправкой запроса
+            if chat_id:
+                self.send_progress_message(chat_id, progress_message_id, 60, "🧠 Генерация ответа...")
+            
             # Отправляем запрос
             response = self.model.generate_content(contents)
+            
+            # Обновляем прогресс после получения ответа
+            if chat_id:
+                self.send_progress_message(chat_id, progress_message_id, 90, "📝 Форматирование ответа...")
+            
+            result = response.text.strip()
             self.increment_counter('successful_requests')
-            return response.text.strip()
+            
+            # Завершаем прогресс
+            if chat_id:
+                self.send_progress_message(chat_id, progress_message_id, 100, "✅ Готово!")
+                time.sleep(1)  # Показываем 100% на секунду
+            
+            # Логируем время
+            self.log_request_time(start_time, "Gemini с файлами", True)
+            
+            return result
+            
         except Exception as e:
             logger.error(f"Ошибка генерации с файлами: {e}")
             self.increment_counter('failed_requests')
             self.update_system_status('last_error', f"Генерация с файлами: {e}")
+            
+            # Показываем ошибку в прогресс-баре
+            if chat_id:
+                self.send_progress_message(chat_id, progress_message_id, 100, f"❌ Ошибка: {str(e)[:100]}")
+            
+            # Логируем время
+            self.log_request_time(start_time, "Gemini с файлами", False)
+            
             return f"Ошибка при обработке запроса: {e}"
     
     def send_chat_action(self, chat_id: int, action: str):
@@ -754,6 +800,13 @@ class SimpleTelegramBot:
 - Статистика запросов и ошибок
 - Мониторинг загруженных файлов и созданных игр
 
+**📝 Система разбитых сообщений:**
+- Автоматическое объединение длинных сообщений
+- Кнопка "✅ Отправить" для завершения поста
+- Таймаут 10 секунд для автоматической отправки
+- Поддержка знаков продолжения (...)
+- Возможность отмены сообщения
+
 **Примеры игр:**
 - 🏰 Фэнтези: эльфы, драконы, магия
 - 🚀 Фантастика: космос, ИИ, будущее
@@ -815,9 +868,17 @@ class SimpleTelegramBot:
     
     def create_game_from_document(self, chat_id: int, user_id: int, document_uri: str, document_name: str):
         """Создание игры на основе загруженного документа"""
+        start_time = datetime.now()
+        
         try:
             self.send_message(chat_id, "🎮 **Создаю игру на основе документа...**\n\nАнализирую содержимое документа и создаю ролевую игру.")
             self.send_chat_action(chat_id, "typing")
+            
+            # Отправляем прогресс
+            progress_response = self.send_progress_message(chat_id, None, 10, "📄 Анализ документа...")
+            progress_message_id = None
+            if progress_response and isinstance(progress_response, dict) and progress_response.get('ok'):
+                progress_message_id = progress_response['result']['message_id']
             
             # Формируем промпт для анализа документа и создания игры
             analysis_prompt = f"""
@@ -855,11 +916,15 @@ class SimpleTelegramBot:
 Создай интересную и захватывающую игру, используя ВСЕ детали из документа!
             """
             
+            self.send_progress_message(chat_id, progress_message_id, 30, "🧠 Создание ролевой игры...")
+            
             # Отправляем запрос с документом
-            response = self.generate_with_files(analysis_prompt, [document_uri])
+            response = self.generate_with_files(analysis_prompt, [document_uri], chat_id, progress_message_id)
             
             # Добавляем задержку
             time.sleep(3)
+            
+            self.send_progress_message(chat_id, progress_message_id, 80, "💾 Сохранение игры...")
             
             # Создаем объект игры на основе ответа
             game_id = f"doc_game_{user_id}_{int(time.time())}"
@@ -916,6 +981,10 @@ class SimpleTelegramBot:
             # Добавляем начальное сообщение в историю
             session['chat_history'].append({"role": "assistant", "content": response})
             
+            # Завершаем прогресс
+            self.send_progress_message(chat_id, progress_message_id, 100, "✅ Игра создана!")
+            time.sleep(1)
+            
             # Отправляем ответ с информацией о созданной игре
             final_response = f"""
 ✅ **Загрузка завершена!**
@@ -931,8 +1000,19 @@ class SimpleTelegramBot:
             
             self.send_message(chat_id, final_response)
             
+            # Логируем время
+            self.log_request_time(start_time, "Создание игры из документа", True)
+            
         except Exception as e:
             logger.error(f"Ошибка создания игры из документа: {e}")
+            
+            # Показываем ошибку в прогресс-баре
+            if 'progress_message_id' in locals():
+                self.send_progress_message(chat_id, progress_message_id, 100, f"❌ Ошибка: {str(e)[:100]}")
+            
+            # Логируем время
+            self.log_request_time(start_time, "Создание игры из документа", False)
+            
             self.send_message(chat_id, f"❌ Ошибка создания игры: {e}\n\nПопробуйте создать игру вручную командой /new")
     
     def ask_character_info(self, chat_id: int, user_id: int, character_number: int):
@@ -1430,6 +1510,10 @@ class SimpleTelegramBot:
             self.send_status_message(chat_id, "detailed")
         elif callback_data == "status_refresh":
             self.send_status_message(chat_id, "general")
+        elif callback_data == "send_complete_message":
+            self.handle_send_complete_message(chat_id, user_id)
+        elif callback_data == "cancel_message":
+            self.handle_cancel_message(chat_id, user_id)
     
     def handle_photo(self, message):
         """Обработка загруженного изображения"""
@@ -1564,6 +1648,31 @@ class SimpleTelegramBot:
         if session.get('creating_new_game'):
             self.handle_game_creation_message(chat_id, user_id, text)
             return
+        
+        # Обработка разбитых сообщений
+        if session.get('waiting_for_complete_message'):
+            # Пользователь продолжает писать
+            needs_more = self.add_message_to_buffer(user_id, text)
+            
+            if needs_more:
+                # Показываем кнопку для завершения
+                self.send_message_complete_button(chat_id, user_id)
+                return
+            else:
+                # Сообщение завершено, получаем полный текст
+                complete_text = self.get_complete_message(user_id)
+                text = complete_text
+        else:
+            # Проверяем, нужно ли начать буферизацию
+            needs_more = self.add_message_to_buffer(user_id, text)
+            
+            if needs_more:
+                # Показываем кнопку для завершения
+                self.send_message_complete_button(chat_id, user_id)
+                return
+            else:
+                # Обычное короткое сообщение
+                text = self.get_complete_message(user_id) if session['message_buffer'] else text
         
         # Добавляем сообщение пользователя в историю
         session['chat_history'].append({"role": "user", "content": text})
@@ -1758,9 +1867,16 @@ class SimpleTelegramBot:
         logger.info("Бот запущен!")
         self.update_system_status('telegram_connected', True)
         offset = None
+        last_timeout_check = datetime.now()
         
         while True:
             try:
+                # Проверяем таймауты сообщений каждые 5 секунд
+                current_time = datetime.now()
+                if (current_time - last_timeout_check).total_seconds() > 5:
+                    self.check_message_timeouts()
+                    last_timeout_check = current_time
+                
                 updates = self.get_updates(offset)
                 if updates and updates.get('ok'):
                     for update in updates['result']:
@@ -1802,6 +1918,13 @@ class SimpleTelegramBot:
         """Отправка сообщения о состоянии системы"""
         status = self.get_system_status()
         
+        # Вычисляем среднее время запросов
+        avg_time = 0
+        if hasattr(self, 'request_times') and self.request_times:
+            successful_times = [req['duration'] for req in self.request_times if req['success']]
+            if successful_times:
+                avg_time = sum(successful_times) / len(successful_times)
+        
         if status_type == "detailed":
             message = f"""
 🤖 **Состояние системы Нейкона**
@@ -1816,6 +1939,7 @@ class SimpleTelegramBot:
 • Успешных: {status['successful_requests']}
 • Ошибок: {status['failed_requests']}
 • Процент успеха: {status['success_rate']:.1f}%
+• Среднее время запроса: {avg_time:.2f} сек
 
 📁 **Файлы и игры:**
 • Загружено файлов: {status['files_uploaded']}
@@ -1837,6 +1961,7 @@ class SimpleTelegramBot:
 
 📊 Запросов: {status['total_requests']} | Успех: {status['success_rate']:.1f}%
 📁 Файлов: {status['files_uploaded']} | Игр: {status['games_created']}
+⏱️ Среднее время: {avg_time:.2f} сек
             """
         
         self.send_message(chat_id, message)
@@ -1900,6 +2025,327 @@ class SimpleTelegramBot:
         except Exception as e:
             logger.error(f"Ошибка в split_message_with_ai: {e}")
             return self.split_long_message(text, max_length)
+    
+    def add_message_to_buffer(self, user_id: int, message_text: str) -> bool:
+        """Добавление сообщения в буфер и проверка готовности"""
+        session = self.get_user_session(user_id)
+        current_time = datetime.now()
+        
+        # Добавляем сообщение в буфер
+        session['message_buffer'].append(message_text)
+        session['last_message_time'] = current_time
+        
+        # Проверяем, нужно ли ждать продолжения
+        if len(' '.join(session['message_buffer'])) < 1000:  # Короткие сообщения сразу отправляем
+            return False
+        
+        # Если сообщение заканчивается на знаки продолжения, ждем
+        continuation_signs = ['...', '..', '…', 'и так далее', 'и т.д.', 'продолжение следует']
+        last_message = message_text.strip().lower()
+        
+        for sign in continuation_signs:
+            if last_message.endswith(sign):
+                session['waiting_for_complete_message'] = True
+                return True
+        
+        # Если сообщение слишком длинное, вероятно это продолжение
+        if len(message_text) > 3000:
+            session['waiting_for_complete_message'] = True
+            return True
+        
+        return False
+    
+    def is_message_complete(self, user_id: int) -> bool:
+        """Проверка, завершено ли сообщение"""
+        session = self.get_user_session(user_id)
+        
+        if not session['waiting_for_complete_message']:
+            return True
+        
+        # Проверяем таймаут
+        if session['last_message_time']:
+            time_diff = (datetime.now() - session['last_message_time']).total_seconds()
+            if time_diff > session['message_timeout']:
+                return True
+        
+        return False
+    
+    def get_complete_message(self, user_id: int) -> str:
+        """Получение полного сообщения из буфера"""
+        session = self.get_user_session(user_id)
+        complete_message = ' '.join(session['message_buffer'])
+        
+        # Очищаем буфер
+        session['message_buffer'] = []
+        session['waiting_for_complete_message'] = False
+        session['last_message_time'] = None
+        
+        return complete_message
+    
+    def send_message_complete_button(self, chat_id: int, user_id: int):
+        """Отправка кнопки для завершения сообщения"""
+        session = self.get_user_session(user_id)
+        buffer_text = ' '.join(session['message_buffer'])
+        
+        message = f"""
+📝 **Сообщение в процессе написания:**
+
+{buffer_text[:200]}{'...' if len(buffer_text) > 200 else ''}
+
+💡 **Варианты действий:**
+• Продолжите писать - сообщение автоматически добавится
+• Нажмите "✅ Отправить" - отправить текущий текст
+• Подождите 10 секунд - сообщение отправится автоматически
+        """
+        
+        keyboard = {
+            'inline_keyboard': [
+                [{'text': '✅ Отправить', 'callback_data': 'send_complete_message'}],
+                [{'text': '❌ Отменить', 'callback_data': 'cancel_message'}]
+            ]
+        }
+        
+        self.send_message(chat_id, message, keyboard)
+    
+    def handle_send_complete_message(self, chat_id: int, user_id: int):
+        """Обработка отправки завершенного сообщения"""
+        session = self.get_user_session(user_id)
+        
+        if not session['message_buffer']:
+            self.send_message(chat_id, "❌ Нет сообщений для отправки")
+            return
+        
+        # Получаем полное сообщение
+        complete_text = self.get_complete_message(user_id)
+        
+        # Добавляем в историю
+        session['chat_history'].append({"role": "user", "content": complete_text})
+        
+        # Отправляем "печатает" статус
+        self.send_chat_action(chat_id, "typing")
+        
+        # Обрабатываем сообщение как обычно
+        self.process_complete_message(chat_id, user_id, complete_text)
+        
+        self.send_message(chat_id, "✅ Сообщение отправлено и обрабатывается...")
+    
+    def handle_cancel_message(self, chat_id: int, user_id: int):
+        """Обработка отмены сообщения"""
+        session = self.get_user_session(user_id)
+        
+        # Очищаем буфер
+        session['message_buffer'] = []
+        session['waiting_for_complete_message'] = False
+        session['last_message_time'] = None
+        
+        self.send_message(chat_id, "❌ Сообщение отменено. Можете начать заново.")
+    
+    def process_complete_message(self, chat_id: int, user_id: int, text: str):
+        """Обработка завершенного сообщения"""
+        start_time = datetime.now()
+        
+        try:
+            if not self.model:
+                self.send_message(chat_id, 
+                    "❌ Ошибка: Gemini API не инициализирован. "
+                    "Проверьте настройки API ключа.")
+                return
+            
+            # Получаем активную игру
+            active_game = self.get_active_game(user_id)
+            
+            if not active_game:
+                # Нет активной игры - предлагаем создать
+                self.send_message(chat_id, 
+                    "🎮 У вас нет активной ролевой игры. Создайте новую игру командой /new или выберите из сохраненных /games")
+                return
+            
+            # Отправляем начальный прогресс
+            progress_response = self.send_progress_message(chat_id, None, 5, "🎮 Подготовка ролевой игры...")
+            progress_message_id = None
+            if progress_response and isinstance(progress_response, dict) and progress_response.get('ok'):
+                progress_message_id = progress_response['result']['message_id']
+            
+            # Формируем контекст для ролевой игры
+            self.send_progress_message(chat_id, progress_message_id, 15, "📝 Формирование контекста...")
+            
+            context_text = f"{self.system_prompt}\n\n"
+            context_text += f"АКТИВНАЯ ИГРА: {active_game.title}\n"
+            context_text += f"ОПИСАНИЕ МИРА: {active_game.description}\n\n"
+            
+            # Добавляем информацию о персонажах
+            context_text += "ПЕРСОНАЖИ:\n"
+            for char in active_game.characters:
+                context_text += f"- {char.name}: {char.description}\n"
+                context_text += f"  Черты: {char.traits}\n"
+                if char.current_state:
+                    context_text += f"  Состояние: {char.current_state}\n"
+            
+            context_text += f"\nТЕГИ: {', '.join(active_game.tags)}\n\n"
+            
+            # Добавляем историю диалога
+            context_text += "ИСТОРИЯ ДИАЛОГА:\n"
+            session = self.get_user_session(user_id)
+            for msg in session['chat_history'][:-5]:  # Старые сообщения
+                if msg["role"] == "user":
+                    context_text += f"Игрок: {msg['content']}\n"
+                else:
+                    context_text += f"Нейкон: {msg['content']}\n"
+            
+            # Последние 5 сообщений для контекста
+            recent_messages = session['chat_history'][-5:]
+            context_text += "\nПОСЛЕДНИЕ СОБЫТИЯ:\n"
+            for msg in recent_messages[:-1]:
+                if msg["role"] == "user":
+                    context_text += f"Игрок: {msg['content']}\n"
+                else:
+                    context_text += f"Нейкон: {msg['content']}\n"
+            
+            # Текущее сообщение
+            context_text += f"\nИгрок: {text}\n"
+            context_text += "Нейкон:"
+            
+            # Собираем файлы памяти для подключения
+            self.send_progress_message(chat_id, progress_message_id, 30, "💾 Подключение памяти игры...")
+            
+            file_uris = []
+            if active_game.chat_log_file_uri:
+                file_uris.append(active_game.chat_log_file_uri)
+            if active_game.checkpoint_file_uri:
+                file_uris.append(active_game.checkpoint_file_uri)
+            
+            # Добавляем информацию о последних постах из памяти
+            if active_game.chat_log_file_uri or active_game.checkpoint_file_uri:
+                context_text += "\n💾 ПАМЯТЬ ИГРЫ: В памяти есть сохраненная история и состояние персонажей. Используй эту информацию для продолжения игры.\n"
+            
+            # Отправляем запрос с подключенными файлами памяти
+            if file_uris:
+                assistant_message = self.generate_with_files(context_text, file_uris, chat_id, progress_message_id)
+            else:
+                self.increment_counter('total_requests')
+                try:
+                    self.send_progress_message(chat_id, progress_message_id, 60, "🧠 Генерация ответа...")
+                    
+                    response = self.model.generate_content(context_text)
+                    assistant_message = response.text.strip()
+                    
+                    self.increment_counter('successful_requests')
+                    self.send_progress_message(chat_id, progress_message_id, 90, "📝 Форматирование ответа...")
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка генерации: {e}")
+                    self.increment_counter('failed_requests')
+                    self.update_system_status('last_error', f"Генерация: {e}")
+                    assistant_message = f"❌ Ошибка при обработке запроса: {e}"
+                    self.send_progress_message(chat_id, progress_message_id, 100, f"❌ Ошибка: {str(e)[:100]}")
+            
+            # Добавляем задержку для экономии квоты
+            time.sleep(3)
+            
+            # Добавляем ответ в историю
+            session['chat_history'].append({"role": "assistant", "content": assistant_message})
+            
+            # Завершаем прогресс
+            self.send_progress_message(chat_id, progress_message_id, 100, "✅ Готово!")
+            time.sleep(1)
+            
+            # Отправляем ответ
+            self.send_message(chat_id, assistant_message)
+            
+            # Логируем время
+            self.log_request_time(start_time, "Ролевая игра", True)
+            
+        except Exception as e:
+            logger.error(f"Ошибка при обработке завершенного сообщения: {e}")
+            
+            # Показываем ошибку в прогресс-баре
+            if 'progress_message_id' in locals():
+                self.send_progress_message(chat_id, progress_message_id, 100, f"❌ Ошибка: {str(e)[:100]}")
+            
+            # Логируем время
+            self.log_request_time(start_time, "Ролевая игра", False)
+            
+            # Проверяем ошибку квоты
+            if "429" in str(e) or "quota" in str(e).lower():
+                self.send_message(chat_id, 
+                    "⚠️ Превышен лимит запросов к Gemini API. Попробуйте через несколько минут.")
+            else:
+                self.send_message(chat_id, 
+                    "❌ Произошла ошибка при обработке сообщения. Попробуйте позже.")
+
+    def check_message_timeouts(self):
+        """Проверка таймаутов сообщений для всех пользователей"""
+        current_time = datetime.now()
+        
+        for user_id, session in self.user_sessions.items():
+            if session.get('waiting_for_complete_message') and session.get('last_message_time'):
+                time_diff = (current_time - session['last_message_time']).total_seconds()
+                
+                if time_diff > session.get('message_timeout', 10):
+                    # Таймаут истек, отправляем сообщение автоматически
+                    logger.info(f"Таймаут сообщения для пользователя {user_id}")
+                    
+                    if session['message_buffer']:
+                        complete_text = self.get_complete_message(user_id)
+                        session['chat_history'].append({"role": "user", "content": complete_text})
+                        
+                        # Находим chat_id для пользователя (нужно сохранить в сессии)
+                        # Пока просто логируем
+                        logger.info(f"Автоматически отправлено сообщение пользователю {user_id}: {complete_text[:100]}...")
+
+    def send_progress_message(self, chat_id: int, message_id: int = None, progress: int = 0, status: str = ""):
+        """Отправка сообщения с прогресс-баром"""
+        progress_bar_length = 20
+        filled_length = int(progress_bar_length * progress / 100)
+        bar = "█" * filled_length + "░" * (progress_bar_length - filled_length)
+        
+        progress_text = f"""
+🤖 **Обработка запроса...**
+
+{bar} {progress}%
+
+{status}
+        """
+        
+        if message_id:
+            # Обновляем существующее сообщение
+            url = f"{self.base_url}{self.telegram_token}/editMessageText"
+            data = {
+                'chat_id': chat_id,
+                'message_id': message_id,
+                'text': progress_text,
+                'parse_mode': 'Markdown'
+            }
+            try:
+                requests.post(url, json=data)
+            except Exception as e:
+                logger.error(f"Ошибка обновления прогресса: {e}")
+        else:
+            # Отправляем новое сообщение
+            return self.send_message(chat_id, progress_text)
+    
+    def log_request_time(self, start_time: datetime, request_type: str, success: bool = True):
+        """Логирование времени обработки запроса"""
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        
+        status = "✅ УСПЕШНО" if success else "❌ ОШИБКА"
+        logger.info(f"🕐 {request_type} - {status} за {duration:.2f} секунд")
+        
+        # Обновляем статистику времени
+        if not hasattr(self, 'request_times'):
+            self.request_times = []
+        
+        self.request_times.append({
+            'type': request_type,
+            'duration': duration,
+            'success': success,
+            'timestamp': end_time
+        })
+        
+        # Оставляем только последние 100 записей
+        if len(self.request_times) > 100:
+            self.request_times = self.request_times[-100:]
 
 def main():
     """Главная функция"""
