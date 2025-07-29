@@ -59,6 +59,21 @@ class SimpleTelegramBot:
         self.base_url = "https://api.telegram.org/bot"
         self.google_files_api_base = "https://generativelanguage.googleapis.com"
         
+        # Система показателей состояния
+        self.system_status = {
+            'bot_started': False,
+            'gemini_connected': False,
+            'telegram_connected': False,
+            'total_requests': 0,
+            'successful_requests': 0,
+            'failed_requests': 0,
+            'files_uploaded': 0,
+            'games_created': 0,
+            'active_users': 0,
+            'last_error': None,
+            'start_time': None
+        }
+        
         # Загружаем конфигурацию
         self.load_config()
         self.load_settings()
@@ -68,6 +83,10 @@ class SimpleTelegramBot:
         
         # Загружаем сохраненные игры
         self.load_saved_games()
+        
+        # Обновляем статус
+        self.update_system_status('bot_started', True)
+        self.system_status['start_time'] = datetime.now()
     
     def load_config(self):
         """Загрузка конфигурации из config.json"""
@@ -100,14 +119,18 @@ class SimpleTelegramBot:
         """Инициализация Gemini API"""
         if not self.gemini_api_key:
             logger.warning("API ключ Gemini не установлен!")
+            self.update_system_status('gemini_connected', False)
             return
         
         try:
             genai.configure(api_key=self.gemini_api_key)
             self.model = genai.GenerativeModel('gemini-2.5-pro')
             logger.info("Gemini API успешно инициализирован!")
+            self.update_system_status('gemini_connected', True)
         except Exception as e:
             logger.error(f"Ошибка инициализации Gemini API: {e}")
+            self.update_system_status('gemini_connected', False)
+            self.update_system_status('last_error', f"Gemini API: {e}")
     
     def load_saved_games(self):
         """Загрузка сохраненных игр из файла"""
@@ -229,6 +252,10 @@ class SimpleTelegramBot:
                     mime_type=mime_type
                 )
                 logger.info(f"✅ Файл {file_name} успешно загружен: {uploaded_file.uri}")
+                
+                # Обновляем статистику
+                self.increment_counter('files_uploaded')
+                
                 return uploaded_file.uri
             finally:
                 # Удаляем временный файл
@@ -237,6 +264,7 @@ class SimpleTelegramBot:
                 
         except Exception as e:
             logger.error(f"Ошибка загрузки файла в Google API: {e}")
+            self.update_system_status('last_error', f"Загрузка файла: {e}")
             return None
     
     def create_chat_log_pdf(self, chat_history: List[Dict], game_title: str) -> bytes:
@@ -461,24 +489,23 @@ class SimpleTelegramBot:
         
         if len(text) <= MAX_MESSAGE_LENGTH:
             # Обычное сообщение
-        url = f"{self.base_url}{self.telegram_token}/sendMessage"
-        data = {
-            'chat_id': chat_id,
-            'text': text,
-            'parse_mode': 'Markdown'
-        }
-        if reply_markup:
-            data['reply_markup'] = json.dumps(reply_markup)
-        
-        try:
-            response = requests.post(url, json=data)
-            return response.json()
-        except Exception as e:
-            logger.error(f"Ошибка отправки сообщения: {e}")
-            return None
+            url = f"{self.base_url}{self.telegram_token}/sendMessage"
+            data = {
+                'chat_id': chat_id,
+                'text': text,
+                'parse_mode': 'Markdown'
+            }
+            if reply_markup:
+                data['reply_markup'] = json.dumps(reply_markup)
+            try:
+                response = requests.post(url, json=data)
+                return response.json()
+            except Exception as e:
+                logger.error(f"Ошибка отправки сообщения: {e}")
+                return None
         else:
-            # Разбиваем длинное сообщение на части
-            parts = self.split_long_message(text, MAX_MESSAGE_LENGTH)
+            # Разбиваем длинное сообщение на части через ИИ
+            parts = self.split_message_with_ai(text, MAX_MESSAGE_LENGTH)
             responses = []
             
             for i, part in enumerate(parts):
@@ -555,27 +582,28 @@ class SimpleTelegramBot:
     
     def generate_with_files(self, prompt: str, file_uris: List[str]) -> str:
         """Генерация ответа с подключенными файлами"""
+        self.increment_counter('total_requests')
+        
         try:
             # Создаем части для контента
             parts = [{"text": prompt}]
-            
             # Добавляем файлы
             for file_uri in file_uris:
                 parts.append({
-                    "fileData": {
-                        "fileUri": file_uri
+                    "file_data": {
+                        "file_uri": file_uri
                     }
                 })
-            
             # Создаем контент
             contents = [{"parts": parts}]
-            
             # Отправляем запрос
             response = self.model.generate_content(contents)
+            self.increment_counter('successful_requests')
             return response.text.strip()
-            
         except Exception as e:
             logger.error(f"Ошибка генерации с файлами: {e}")
+            self.increment_counter('failed_requests')
+            self.update_system_status('last_error', f"Генерация с файлами: {e}")
             return f"Ошибка при обработке запроса: {e}"
     
     def send_chat_action(self, chat_id: int, action: str):
@@ -656,6 +684,7 @@ class SimpleTelegramBot:
 /start - Главное меню
 /new - Новая ролевая игра
 /games - Список сохраненных игр
+/status - Состояние системы
 /help - Помощь
 
 💾 **Новая система памяти:**
@@ -672,6 +701,7 @@ class SimpleTelegramBot:
             keyboard_buttons.append([{'text': '📚 Мои игры', 'callback_data': 'my_games'}])
         
         keyboard_buttons.append([{'text': '❓ Помощь', 'callback_data': 'help'}])
+        keyboard_buttons.append([{'text': '🤖 Статус системы', 'callback_data': 'status'}])
         
         keyboard = {'inline_keyboard': keyboard_buttons}
         
@@ -687,6 +717,7 @@ class SimpleTelegramBot:
 /new - Создать новую ролевую игру
 /games - Список сохраненных игр
 /memory - Память активной игры
+/status - Состояние системы
 /help - Эта справка
 
 **🎲 Создание ролевой игры:**
@@ -717,6 +748,12 @@ class SimpleTelegramBot:
 - **Переключение**: работать с несколькими играми
 - Все персонажи и события сохраняются
 
+**🤖 Система мониторинга:**
+- /status - просмотр состояния системы
+- Отслеживание подключений к API
+- Статистика запросов и ошибок
+- Мониторинг загруженных файлов и созданных игр
+
 **Примеры игр:**
 - 🏰 Фэнтези: эльфы, драконы, магия
 - 🚀 Фантастика: космос, ИИ, будущее
@@ -728,6 +765,7 @@ class SimpleTelegramBot:
 - Память через Google Files API
 - Автоматическое создание PDF
 - Поддержка множественных персонажей
+- Система мониторинга состояния
 
 Создайте свою первую игру командой /new! 🎲
         """
@@ -865,6 +903,9 @@ class SimpleTelegramBot:
             
             # Сохраняем игры
             self.save_games_to_file()
+            
+            # Обновляем статистику
+            self.increment_counter('games_created')
             
             # Очищаем данные загруженного документа и историю
             session = self.get_user_session(user_id)
@@ -1056,6 +1097,9 @@ class SimpleTelegramBot:
             
             # Сохраняем игры
             self.save_games_to_file()
+            
+            # Обновляем статистику
+            self.increment_counter('games_created')
             
             # Очищаем данные создания
             session['creating_new_game'] = False
@@ -1280,7 +1324,7 @@ class SimpleTelegramBot:
                         last_events = self.generate_with_files(last_events_prompt, file_uris)
                         last_events_info = f"\n\n📖 **Последние события:**\n{last_events}"
                         time.sleep(2)  # Задержка для API
-        except Exception as e:
+                except Exception as e:
                     logger.error(f"Ошибка получения последних событий: {e}")
             
             message = f"""
@@ -1339,7 +1383,7 @@ class SimpleTelegramBot:
         
         if active_game.chat_log_file_uri:
             message += "✅ Полный чат-лог сохранен\n"
-            else:
+        else:
             message += "❌ Чат-лог не создан\n"
             
         if active_game.checkpoint_file_uri:
@@ -1380,6 +1424,12 @@ class SimpleTelegramBot:
         elif callback_data.startswith("load_game_"):
             game_id = callback_data.replace("load_game_", "")
             self.load_game(chat_id, user_id, game_id)
+        elif callback_data == "status":
+            self.handle_status_command(chat_id, user_id)
+        elif callback_data == "status_detailed":
+            self.send_status_message(chat_id, "detailed")
+        elif callback_data == "status_refresh":
+            self.send_status_message(chat_id, "general")
     
     def handle_photo(self, message):
         """Обработка загруженного изображения"""
@@ -1444,7 +1494,7 @@ class SimpleTelegramBot:
             
             if not active_game:
                 # Если нет активной игры, начинаем создание новой
-            session = self.get_user_session(user_id)
+                session = self.get_user_session(user_id)
                 session['uploaded_document_uri'] = file_uri
                 session['uploaded_document_name'] = file_name
                 
@@ -1504,6 +1554,11 @@ class SimpleTelegramBot:
         # Обновляем время последней активности
         session = self.get_user_session(user_id)
         session['last_activity'] = datetime.now()
+        
+        # Обновляем статистику активных пользователей
+        active_users = len([s for s in self.user_sessions.values() 
+                          if (datetime.now() - s.get('last_activity', datetime.now())).seconds < 3600])
+        self.update_system_status('active_users', active_users)
         
         # Проверяем, создается ли новая игра
         if session.get('creating_new_game'):
@@ -1587,8 +1642,16 @@ class SimpleTelegramBot:
             if file_uris:
                 assistant_message = self.generate_with_files(context_text, file_uris)
             else:
-            response = self.model.generate_content(context_text)
-            assistant_message = response.text.strip()
+                self.increment_counter('total_requests')
+                try:
+                    response = self.model.generate_content(context_text)
+                    assistant_message = response.text.strip()
+                    self.increment_counter('successful_requests')
+                except Exception as e:
+                    logger.error(f"Ошибка генерации: {e}")
+                    self.increment_counter('failed_requests')
+                    self.update_system_status('last_error', f"Генерация: {e}")
+                    assistant_message = f"❌ Ошибка при обработке запроса: {e}"
             
             # Добавляем задержку для экономии квоты
             time.sleep(3)
@@ -1618,7 +1681,7 @@ class SimpleTelegramBot:
         if session['new_game_data'].get('waiting_for_count'):
             try:
                 count = int(text.strip())
-                if 2 <= count <= 5:
+                if 2 <= count <= 20:
                     session['new_game_data']['character_count'] = count
                     session['new_game_data']['waiting_for_count'] = False
                     self.ask_character_info(chat_id, user_id, 1)
@@ -1677,6 +1740,8 @@ class SimpleTelegramBot:
                 self.handle_games_command(chat_id, user_id)
             elif text.startswith('/memory'):
                 self.handle_memory_command(chat_id, user_id)
+            elif text.startswith('/status'):
+                self.handle_status_command(chat_id, user_id)
             else:
                 self.handle_message(message)
         
@@ -1687,9 +1752,11 @@ class SimpleTelegramBot:
         """Запуск бота"""
         if not self.telegram_token:
             logger.error("Telegram токен не установлен!")
+            self.update_system_status('telegram_connected', False)
             return
         
         logger.info("Бот запущен!")
+        self.update_system_status('telegram_connected', True)
         offset = None
         
         while True:
@@ -1702,10 +1769,137 @@ class SimpleTelegramBot:
                 
             except KeyboardInterrupt:
                 logger.info("Бот остановлен пользователем")
+                self.update_system_status('bot_started', False)
                 break
             except Exception as e:
                 logger.error(f"Ошибка в главном цикле: {e}")
+                self.update_system_status('last_error', f"Главный цикл: {e}")
                 continue
+    
+    def update_system_status(self, key: str, value):
+        """Обновление показателя состояния системы"""
+        self.system_status[key] = value
+        logger.info(f"Статус обновлен: {key} = {value}")
+    
+    def increment_counter(self, counter_name: str):
+        """Увеличение счетчика"""
+        if counter_name in self.system_status:
+            self.system_status[counter_name] += 1
+    
+    def get_system_status(self) -> Dict:
+        """Получение текущего состояния системы"""
+        uptime = None
+        if self.system_status['start_time']:
+            uptime = datetime.now() - self.system_status['start_time']
+        
+        return {
+            **self.system_status,
+            'uptime': str(uptime) if uptime else None,
+            'success_rate': (self.system_status['successful_requests'] / max(self.system_status['total_requests'], 1)) * 100
+        }
+    
+    def send_status_message(self, chat_id: int, status_type: str = "general"):
+        """Отправка сообщения о состоянии системы"""
+        status = self.get_system_status()
+        
+        if status_type == "detailed":
+            message = f"""
+🤖 **Состояние системы Нейкона**
+
+📊 **Основные показатели:**
+• Бот запущен: {'✅' if status['bot_started'] else '❌'}
+• Gemini подключен: {'✅' if status['gemini_connected'] else '❌'}
+• Telegram подключен: {'✅' if status['telegram_connected'] else '❌'}
+
+📈 **Статистика:**
+• Всего запросов: {status['total_requests']}
+• Успешных: {status['successful_requests']}
+• Ошибок: {status['failed_requests']}
+• Процент успеха: {status['success_rate']:.1f}%
+
+📁 **Файлы и игры:**
+• Загружено файлов: {status['files_uploaded']}
+• Создано игр: {status['games_created']}
+• Активных пользователей: {status['active_users']}
+
+⏱️ **Время работы:** {status['uptime']}
+
+🔧 **Последняя ошибка:** {status['last_error'] or 'Нет'}
+            """
+        else:
+            # Краткий статус
+            message = f"""
+🤖 **Статус Нейкона**
+
+{'✅' if status['bot_started'] else '❌'} Бот: {'Работает' if status['bot_started'] else 'Остановлен'}
+{'✅' if status['gemini_connected'] else '❌'} ИИ: {'Подключен' if status['gemini_connected'] else 'Отключен'}
+{'✅' if status['telegram_connected'] else '❌'} Telegram: {'Подключен' if status['telegram_connected'] else 'Отключен'}
+
+📊 Запросов: {status['total_requests']} | Успех: {status['success_rate']:.1f}%
+📁 Файлов: {status['files_uploaded']} | Игр: {status['games_created']}
+            """
+        
+        self.send_message(chat_id, message)
+    
+    def handle_status_command(self, chat_id: int, user_id: int):
+        """Обработка команды /status"""
+        keyboard = {
+            'inline_keyboard': [
+                [{'text': '📊 Подробная статистика', 'callback_data': 'status_detailed'}],
+                [{'text': '🔄 Обновить', 'callback_data': 'status_refresh'}],
+                [{'text': '🏠 Главное меню', 'callback_data': 'start'}]
+            ]
+        }
+        
+        self.send_status_message(chat_id, "general")
+        self.send_message(chat_id, "Выберите тип отчета:", keyboard)
+    
+    def split_message_with_ai(self, text: str, max_length: int = 4000) -> List[str]:
+        """Разбиение длинного сообщения на части через ИИ"""
+        if len(text) <= max_length:
+            return [text]
+        
+        try:
+            # Формируем промпт для ИИ
+            split_prompt = f"""
+Твоя задача — взять предоставленный ниже текст и разделить его на логические части, пригодные для отправки отдельными сообщениями в Telegram (лимит ~{max_length} символов). 
+
+Вставляй разделитель |||---||| МЕЖДУ частями. Не вставляй его в начале или в конце. 
+Сохраняй исходное форматирование, особенно блоки кода и markdown. 
+Разделяй по абзацам или смысловым блокам.
+
+Текст:
+
+{text}
+            """
+            
+            # Отправляем запрос к ИИ
+            self.increment_counter('total_requests')
+            try:
+                response = self.model.generate_content(split_prompt)
+                result = response.text.strip()
+                self.increment_counter('successful_requests')
+                
+                # Разбиваем по разделителю
+                if "|||---|||" in result:
+                    parts = result.split("|||---|||")
+                    # Очищаем части от лишних пробелов
+                    parts = [part.strip() for part in parts if part.strip()]
+                    return parts
+                else:
+                    # Если ИИ не использовал разделитель, разбиваем вручную
+                    return self.split_long_message(text, max_length)
+                    
+            except Exception as e:
+                logger.error(f"Ошибка разбиения через ИИ: {e}")
+                self.increment_counter('failed_requests')
+                self.update_system_status('last_error', f"Разбиение через ИИ: {e}")
+                # Возвращаемся к ручному разбиению
+                return self.split_long_message(text, max_length)
+                
+        except Exception as e:
+            logger.error(f"Ошибка в split_message_with_ai: {e}")
+            return self.split_long_message(text, max_length)
 
 def main():
     """Главная функция"""
