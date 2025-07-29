@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Простой Telegram бот "Хроники Нейкона" без проблемных зависимостей
+Простой Telegram бот "Хроники Нейкона" с продвинутой системой памяти
 """
 
 import os
@@ -9,11 +9,11 @@ import logging
 import requests
 import time
 from datetime import datetime
-from typing import Dict
-import google.generativeai as genai
-
+from typing import Dict, List, Optional
 import google.generativeai as genai
 from dotenv import load_dotenv
+import io
+import tempfile
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -25,6 +25,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class RoleplayGame:
+    """Класс для хранения данных ролевой игры"""
+    def __init__(self, game_id: str, title: str, description: str, tags: List[str]):
+        self.game_id = game_id
+        self.title = title
+        self.description = description
+        self.tags = tags
+        self.characters = []
+        self.chat_log_file_uri = None  # URI файла с полным чат-логом
+        self.checkpoint_file_uri = None  # URI файла с чекпоинтом
+        self.created_at = datetime.now()
+        self.last_updated = datetime.now()
+        self.is_active = False
+
+class Character:
+    """Класс для хранения данных персонажа"""
+    def __init__(self, name: str, description: str, traits: str, backstory: str):
+        self.name = name
+        self.description = description
+        self.traits = traits
+        self.backstory = backstory
+        self.current_state = ""
+        self.relationships = {}
+
 class SimpleTelegramBot:
     def __init__(self):
         self.system_prompt = ""
@@ -33,6 +57,7 @@ class SimpleTelegramBot:
         self.model = None
         self.user_sessions: Dict[int, Dict] = {}
         self.base_url = "https://api.telegram.org/bot"
+        self.google_files_api_base = "https://generativelanguage.googleapis.com"
         
         # Загружаем конфигурацию
         self.load_config()
@@ -40,6 +65,9 @@ class SimpleTelegramBot:
         
         # Инициализируем Gemini
         self.initialize_gemini()
+        
+        # Загружаем сохраненные игры
+        self.load_saved_games()
     
     def load_config(self):
         """Загрузка конфигурации из config.json"""
@@ -81,6 +109,280 @@ class SimpleTelegramBot:
         except Exception as e:
             logger.error(f"Ошибка инициализации Gemini API: {e}")
     
+    def load_saved_games(self):
+        """Загрузка сохраненных игр из файла"""
+        try:
+            if os.path.exists('saved_games.json'):
+                with open('saved_games.json', 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.saved_games = {}
+                    for user_id, games_data in data.items():
+                        self.saved_games[int(user_id)] = []
+                        for game_data in games_data:
+                            game = RoleplayGame(
+                                game_data['game_id'],
+                                game_data['title'], 
+                                game_data['description'],
+                                game_data['tags']
+                            )
+                            game.chat_log_file_uri = game_data.get('chat_log_file_uri')
+                            game.checkpoint_file_uri = game_data.get('checkpoint_file_uri')
+                            game.created_at = datetime.fromisoformat(game_data['created_at'])
+                            game.last_updated = datetime.fromisoformat(game_data['last_updated'])
+                            game.is_active = game_data.get('is_active', False)
+                            
+                            # Загружаем персонажей
+                            for char_data in game_data.get('characters', []):
+                                char = Character(
+                                    char_data['name'],
+                                    char_data['description'],
+                                    char_data['traits'],
+                                    char_data['backstory']
+                                )
+                                char.current_state = char_data.get('current_state', '')
+                                char.relationships = char_data.get('relationships', {})
+                                game.characters.append(char)
+                            
+                            self.saved_games[int(user_id)].append(game)
+            else:
+                self.saved_games = {}
+        except Exception as e:
+            logger.error(f"Ошибка загрузки сохраненных игр: {e}")
+            self.saved_games = {}
+    
+    def save_games_to_file(self):
+        """Сохранение игр в файл"""
+        try:
+            data = {}
+            for user_id, games in self.saved_games.items():
+                data[str(user_id)] = []
+                for game in games:
+                    characters_data = []
+                    for char in game.characters:
+                        characters_data.append({
+                            'name': char.name,
+                            'description': char.description,
+                            'traits': char.traits,
+                            'backstory': char.backstory,
+                            'current_state': char.current_state,
+                            'relationships': char.relationships
+                        })
+                    
+                    data[str(user_id)].append({
+                        'game_id': game.game_id,
+                        'title': game.title,
+                        'description': game.description,
+                        'tags': game.tags,
+                        'chat_log_file_uri': game.chat_log_file_uri,
+                        'checkpoint_file_uri': game.checkpoint_file_uri,
+                        'created_at': game.created_at.isoformat(),
+                        'last_updated': game.last_updated.isoformat(),
+                        'is_active': game.is_active,
+                        'characters': characters_data
+                    })
+            
+            with open('saved_games.json', 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Ошибка сохранения игр: {e}")
+    
+    def upload_file_to_google(self, file_content: bytes, file_name: str, mime_type: str) -> Optional[str]:
+        """Загрузка файла в Google Files API"""
+        try:
+            # Создаем временный файл
+            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                temp_file.write(file_content)
+                temp_file_path = temp_file.name
+            
+            try:
+                # Загружаем файл через genai
+                uploaded_file = genai.upload_file(temp_file_path, display_name=file_name)
+                logger.info(f"Файл {file_name} загружен: {uploaded_file.uri}")
+                return uploaded_file.uri
+            finally:
+                # Удаляем временный файл
+                os.unlink(temp_file_path)
+                
+        except Exception as e:
+            logger.error(f"Ошибка загрузки файла в Google API: {e}")
+            return None
+    
+    def create_chat_log_pdf(self, chat_history: List[Dict], game_title: str) -> bytes:
+        """Создание PDF с чат-логом"""
+        try:
+            from reportlab.lib.pagesizes import letter
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.units import inch
+            from reportlab.pdfbase import pdfmetrics
+            from reportlab.pdfbase.ttfonts import TTFont
+            
+            # Создаем временный файл для PDF
+            temp_pdf = io.BytesIO()
+            
+            # Создаем документ
+            doc = SimpleDocTemplate(temp_pdf, pagesize=letter, 
+                                  rightMargin=72, leftMargin=72,
+                                  topMargin=72, bottomMargin=18)
+            
+            # Стили
+            styles = getSampleStyleSheet()
+            title_style = ParagraphStyle('CustomTitle', 
+                                       parent=styles['Heading1'],
+                                       fontSize=16, 
+                                       alignment=1,  # центрирование
+                                       spaceAfter=30)
+            
+            user_style = ParagraphStyle('UserMessage',
+                                      parent=styles['Normal'],
+                                      fontSize=12,
+                                      leftIndent=20,
+                                      fontName='Helvetica-Bold')
+            
+            assistant_style = ParagraphStyle('AssistantMessage',
+                                           parent=styles['Normal'],
+                                           fontSize=12,
+                                           leftIndent=40)
+            
+            # Содержимое документа
+            story = []
+            
+            # Заголовок
+            story.append(Paragraph(f"Чат-лог ролевой игры: {game_title}", title_style))
+            story.append(Spacer(1, 12))
+            
+            # Добавляем сообщения
+            for msg in chat_history:
+                if msg["role"] == "user":
+                    story.append(Paragraph(f"<b>Пользователь:</b> {msg['content']}", user_style))
+                else:
+                    story.append(Paragraph(f"<b>Нейкон:</b> {msg['content']}", assistant_style))
+                story.append(Spacer(1, 6))
+            
+            # Генерируем PDF
+            doc.build(story)
+            
+            # Возвращаем содержимое
+            temp_pdf.seek(0)
+            return temp_pdf.getvalue()
+            
+        except ImportError:
+            logger.error("Для создания PDF нужна библиотека reportlab. Установите: pip install reportlab")
+            # Создаем простой текстовый файл вместо PDF
+            content = f"Чат-лог ролевой игры: {game_title}\n\n"
+            for msg in chat_history:
+                if msg["role"] == "user":
+                    content += f"Пользователь: {msg['content']}\n\n"
+                else:
+                    content += f"Нейкон: {msg['content']}\n\n"
+            return content.encode('utf-8')
+        except Exception as e:
+            logger.error(f"Ошибка создания PDF: {e}")
+            return None
+    
+    def create_checkpoint_pdf(self, game: RoleplayGame, recent_messages: List[Dict]) -> bytes:
+        """Создание PDF с чекпоинтом игры"""
+        try:
+            from reportlab.lib.pagesizes import letter
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.units import inch
+            
+            # Создаем временный файл для PDF
+            temp_pdf = io.BytesIO()
+            
+            # Создаем документ
+            doc = SimpleDocTemplate(temp_pdf, pagesize=letter, 
+                                  rightMargin=72, leftMargin=72,
+                                  topMargin=72, bottomMargin=18)
+            
+            # Стили
+            styles = getSampleStyleSheet()
+            title_style = ParagraphStyle('CustomTitle', 
+                                       parent=styles['Heading1'],
+                                       fontSize=16, 
+                                       alignment=1,
+                                       spaceAfter=30)
+            
+            heading_style = ParagraphStyle('CustomHeading',
+                                         parent=styles['Heading2'],
+                                         fontSize=14,
+                                         spaceAfter=12)
+            
+            # Содержимое документа
+            story = []
+            
+            # Заголовок
+            story.append(Paragraph(f"Чекпоинт: {game.title}", title_style))
+            story.append(Spacer(1, 12))
+            
+            # Описание игры
+            story.append(Paragraph("Описание игры:", heading_style))
+            story.append(Paragraph(game.description, styles['Normal']))
+            story.append(Spacer(1, 12))
+            
+            # Теги
+            if game.tags:
+                story.append(Paragraph("Теги:", heading_style))
+                story.append(Paragraph(", ".join(game.tags), styles['Normal']))
+                story.append(Spacer(1, 12))
+            
+            # Персонажи
+            story.append(Paragraph("Персонажи:", heading_style))
+            for char in game.characters:
+                story.append(Paragraph(f"<b>{char.name}</b>", styles['Normal']))
+                story.append(Paragraph(f"Описание: {char.description}", styles['Normal']))
+                story.append(Paragraph(f"Черты: {char.traits}", styles['Normal']))
+                story.append(Paragraph(f"Предыстория: {char.backstory}", styles['Normal']))
+                if char.current_state:
+                    story.append(Paragraph(f"Текущее состояние: {char.current_state}", styles['Normal']))
+                story.append(Spacer(1, 8))
+            
+            # Последние сообщения
+            story.append(Paragraph("Последние события:", heading_style))
+            for msg in recent_messages[-10:]:  # Последние 10 сообщений
+                if msg["role"] == "user":
+                    story.append(Paragraph(f"<b>Пользователь:</b> {msg['content']}", styles['Normal']))
+                else:
+                    story.append(Paragraph(f"<b>Нейкон:</b> {msg['content']}", styles['Normal']))
+                story.append(Spacer(1, 6))
+            
+            # Генерируем PDF
+            doc.build(story)
+            
+            # Возвращаем содержимое
+            temp_pdf.seek(0)
+            return temp_pdf.getvalue()
+            
+        except ImportError:
+            logger.error("Для создания PDF нужна библиотека reportlab")
+            # Создаем простой текстовый файл
+            content = f"Чекпоинт: {game.title}\n\n"
+            content += f"Описание: {game.description}\n\n"
+            if game.tags:
+                content += f"Теги: {', '.join(game.tags)}\n\n"
+            
+            content += "Персонажи:\n"
+            for char in game.characters:
+                content += f"\n{char.name}:\n"
+                content += f"  Описание: {char.description}\n"
+                content += f"  Черты: {char.traits}\n"
+                content += f"  Предыстория: {char.backstory}\n"
+                if char.current_state:
+                    content += f"  Текущее состояние: {char.current_state}\n"
+            
+            content += "\nПоследние события:\n"
+            for msg in recent_messages[-10:]:
+                if msg["role"] == "user":
+                    content += f"Пользователь: {msg['content']}\n"
+                else:
+                    content += f"Нейкон: {msg['content']}\n"
+            
+            return content.encode('utf-8')
+        except Exception as e:
+            logger.error(f"Ошибка создания чекпоинта: {e}")
+            return None
+
     def get_user_session(self, user_id: int) -> Dict:
         """Получение или создание сессии пользователя"""
         if user_id not in self.user_sessions:
@@ -88,10 +390,37 @@ class SimpleTelegramBot:
                 'chat_history': [],
                 'current_game': None,
                 'last_activity': datetime.now(),
-                'files': [],  # Список сохраненных файлов
-                'images': []   # Список сохраненных изображений
+                'creating_new_game': False,
+                'new_game_data': {},
+                'character_creation_step': 0
             }
         return self.user_sessions[user_id]
+
+    def get_active_game(self, user_id: int) -> Optional[RoleplayGame]:
+        """Получение активной игры пользователя"""
+        if user_id not in self.saved_games:
+            return None
+        
+        for game in self.saved_games[user_id]:
+            if game.is_active:
+                return game
+        return None
+
+    def set_active_game(self, user_id: int, game_id: str):
+        """Установка активной игры"""
+        if user_id not in self.saved_games:
+            return False
+        
+        # Деактивируем все игры
+        for game in self.saved_games[user_id]:
+            game.is_active = False
+        
+        # Активируем нужную игру
+        for game in self.saved_games[user_id]:
+            if game.game_id == game_id:
+                game.is_active = True
+                return True
+        return False
     
     def send_message(self, chat_id: int, text: str, reply_markup=None):
         """Отправка сообщения через Telegram API"""
@@ -110,6 +439,31 @@ class SimpleTelegramBot:
         except Exception as e:
             logger.error(f"Ошибка отправки сообщения: {e}")
             return None
+    
+    def generate_with_files(self, prompt: str, file_uris: List[str]) -> str:
+        """Генерация ответа с подключенными файлами"""
+        try:
+            # Создаем части для контента
+            parts = [{"text": prompt}]
+            
+            # Добавляем файлы
+            for file_uri in file_uris:
+                parts.append({
+                    "fileData": {
+                        "fileUri": file_uri
+                    }
+                })
+            
+            # Создаем контент
+            contents = [{"parts": parts}]
+            
+            # Отправляем запрос
+            response = self.model.generate_content(contents)
+            return response.text.strip()
+            
+        except Exception as e:
+            logger.error(f"Ошибка генерации с файлами: {e}")
+            return f"Ошибка при обработке запроса: {e}"
     
     def send_chat_action(self, chat_id: int, action: str):
         """Отправка действия чата"""
@@ -161,98 +515,7 @@ class SimpleTelegramBot:
             logger.error(f"Ошибка скачивания файла: {e}")
             return None
     
-    def extract_text_from_document(self, file_content, file_name):
-        """Извлечение текста из документа"""
-        try:
-            # Определяем тип файла по расширению
-            file_ext = file_name.lower().split('.')[-1]
-            
-            if file_ext in ['txt', 'md']:
-                # Текстовые файлы
-                return file_content.decode('utf-8', errors='ignore')
-            
-            elif file_ext in ['pdf']:
-                # PDF файлы - используем PyPDF2 если доступен
-                try:
-                    import PyPDF2
-                    import io
-                    pdf_file = io.BytesIO(file_content)
-                    pdf_reader = PyPDF2.PdfReader(pdf_file)
-                    text = ""
-                    for page in pdf_reader.pages:
-                        text += page.extract_text() + "\n"
-                    return text
-                except ImportError:
-                    return "PDF файл получен, но для чтения нужна библиотека PyPDF2. Установите: pip install PyPDF2"
-            
-            elif file_ext in ['docx']:
-                # DOCX файлы
-                try:
-                    from docx import Document
-                    import io
-                    doc = Document(io.BytesIO(file_content))
-                    text = ""
-                    for paragraph in doc.paragraphs:
-                        text += paragraph.text + "\n"
-                    return text
-                except ImportError:
-                    return "DOCX файл получен, но для чтения нужна библиотека python-docx. Установите: pip install python-docx"
-            
-            else:
-                return f"Неподдерживаемый тип файла: {file_ext}. Поддерживаются: txt, md, pdf, docx"
-                
-        except Exception as e:
-            logger.error(f"Ошибка извлечения текста: {e}")
-            return f"Ошибка при чтении файла: {e}"
-    
-    def save_file_to_memory(self, user_id: int, file_info: dict, file_content: bytes, file_type: str):
-        """Сохранение файла в память пользователя"""
-        session = self.get_user_session(user_id)
-        
-        file_data = {
-            'name': file_info.get('name', 'unknown'),
-            'type': file_type,
-            'content': file_content,
-            'description': file_info.get('description', ''),
-            'timestamp': datetime.now().isoformat(),
-            'size': len(file_content)
-        }
-        
-        if file_type == 'document':
-            session['files'].append(file_data)
-            # Ограничиваем количество сохраненных файлов
-            if len(session['files']) > 10:
-                session['files'] = session['files'][-10:]
-        elif file_type == 'image':
-            session['images'].append(file_data)
-            # Ограничиваем количество сохраненных изображений
-            if len(session['images']) > 10:
-                session['images'] = session['images'][-10:]
-    
-    def get_memory_context(self, user_id: int) -> str:
-        """Получение контекста памяти для пользователя"""
-        session = self.get_user_session(user_id)
-        context = ""
-        
-        # Добавляем информацию о сохраненных файлах
-        if session['files']:
-            context += "\n📄 Сохраненные документы:\n"
-            for i, file_data in enumerate(session['files'], 1):
-                context += f"{i}. {file_data['name']}"
-                if file_data['description']:
-                    context += f" - {file_data['description']}"
-                context += f" ({file_data['timestamp'][:10]})\n"
-        
-        # Добавляем информацию о сохраненных изображениях
-        if session['images']:
-            context += "\n🖼️ Сохраненные изображения:\n"
-            for i, image_data in enumerate(session['images'], 1):
-                context += f"{i}. {image_data['name']}"
-                if image_data['description']:
-                    context += f" - {image_data['description']}"
-                context += f" ({image_data['timestamp'][:10]})\n"
-        
-        return context
+
     
     def answer_callback_query(self, callback_query_id: str, text: str = None):
         """Ответ на callback query"""
@@ -266,77 +529,94 @@ class SimpleTelegramBot:
         except Exception as e:
             logger.error(f"Ошибка ответа на callback: {e}")
     
-    def handle_start_command(self, chat_id: int, user_name: str):
+    def handle_start_command(self, chat_id: int, user_id: int, user_name: str):
         """Обработка команды /start"""
+        # Проверяем наличие сохраненных игр
+        saved_games = self.saved_games.get(user_id, [])
+        
         welcome_text = f"""
 🎮 Добро пожаловать в "Хроники Нейкона", {user_name}!
 
-Я — Нейкон, ваш ИИ-Мастер Игры для ролевых игр. 
+Я — Нейкон, ваш ИИ-Мастер Игры для ролевых игр с продвинутой системой памяти.
 
 📋 Доступные команды:
-/start - Начать игру
-/new - Новая история
+/start - Главное меню
+/new - Новая ролевая игра
+/games - Список сохраненных игр
 /help - Помощь
 
-Просто напишите мне, чтобы начать ролевую игру!
+💾 **Новая система памяти:**
+- Все ролевые игры сохраняются автоматически
+- Каждая игра имеет полный чат-лог и чекпоинты
+- Можно переключаться между разными ролевыми играми
         """
         
-        keyboard = {
-            'inline_keyboard': [
-                [{'text': '🎮 Новая игра', 'callback_data': 'new_game'}],
-                [{'text': '📚 Помощь', 'callback_data': 'help'}]
-            ]
-        }
+        keyboard_buttons = [
+            [{'text': '🎮 Новая игра', 'callback_data': 'new_game'}]
+        ]
+        
+        if saved_games:
+            keyboard_buttons.append([{'text': '📚 Мои игры', 'callback_data': 'my_games'}])
+        
+        keyboard_buttons.append([{'text': '❓ Помощь', 'callback_data': 'help'}])
+        
+        keyboard = {'inline_keyboard': keyboard_buttons}
         
         self.send_message(chat_id, welcome_text, keyboard)
     
     def handle_help_command(self, chat_id: int):
         """Обработка команды /help"""
         help_text = """
-🎮 **Хроники Нейкона - Помощь**
+🎮 **Хроники Нейкона - Продвинутая ролевая система**
 
 **Основные команды:**
-/start - Запуск бота
-/new - Начать новую игру
-/memory - Просмотр сохраненных файлов
+/start - Главное меню
+/new - Создать новую ролевую игру
+/games - Список сохраненных игр
+/memory - Память активной игры
 /help - Эта справка
 
-**Как играть:**
-1. Нажмите "Новая игра" или напишите /new
-2. Опишите, в какую ролевую игру хотите играть
-3. Нейкон создаст мир и начнет игру
-4. Отвечайте на вопросы и описывайте действия
+**🎲 Создание ролевой игры:**
+1. Выберите количество персонажей (1-5)
+2. Опишите каждого персонажа детально
+3. Задайте мир и историю
+4. Добавьте теги для жанра
+5. Начинайте играть!
 
-**📄 Анализ документов:**
-- Загрузите документ (PDF, DOCX, TXT, MD)
-- Нейкон проанализирует содержимое
-- Получите подробный анализ и рекомендации
-- Максимальный размер файла: 20MB
+**💾 Продвинутая система памяти:**
+- Каждая игра имеет **2 файла памяти**:
+  📚 **Чат-лог** - полная история всех событий
+  💾 **Чекпоинт** - текущее состояние персонажей
+- Все файлы сохраняются в Google Files API
+- Нейкон всегда помнит весь контекст игры
+- Можно переключаться между играми
 
-**🖼️ Анализ изображений:**
-- Отправьте фото с описанием или без
-- Нейкон проанализирует изображение
-- Интегрирует его в ролевую игру
-- Максимальный размер файла: 20MB
+**📄 Загрузка PDF документов:**
+- Поддерживаются файлы до 20MB
+- PDF автоматически интегрируется в память игры
+- Файлы с "chat" или "log" → чат-лог
+- Остальные файлы → чекпоинт
+- Документы доступны через весь диалог
 
-**Поддерживаемые форматы:**
-- 📄 PDF (.pdf)
-- 📝 Word (.docx)
-- 📄 Текст (.txt, .md)
-- 🖼️ Изображения (JPG, PNG, GIF)
-
-**💾 Постоянная память:**
-- Все загруженные документы и изображения сохраняются
-- Нейкон помнит все файлы и их содержимое
-- Используйте /memory для просмотра сохраненных файлов
-- Память автоматически включается в контекст игры
+**🎮 Управление играми:**
+- **Сохранение**: завершить текущую игру и сохранить
+- **Загрузка**: продолжить любую сохраненную игру
+- **Переключение**: работать с несколькими играми
+- Все персонажи и события сохраняются
 
 **Примеры игр:**
-- Фэнтези (эльфы, драконы, магия)
-- Научная фантастика (космос, роботы)
-- Детектив (расследования, загадки)
+- 🏰 Фэнтези: эльфы, драконы, магия
+- 🚀 Фантастика: космос, ИИ, будущее
+- 🕵️ Детектив: расследования, тайны
+- 🏴‍☠️ Приключения: пираты, сокровища
 
-Удачной игры! 🎲
+**Технические особенности:**
+- Использует Gemini 2.5 Pro
+- Память через Google Files API
+- Автоматическое создание PDF
+- Поддержка множественных персонажей
+
+Создайте свою первую игру командой /new! 🎲
         """
         self.send_message(chat_id, help_text)
     
@@ -344,29 +624,473 @@ class SimpleTelegramBot:
         """Обработка команды /new"""
         session = self.get_user_session(user_id)
         
-        # Очищаем историю
-        session['chat_history'] = []
-        session['current_game'] = None
+        # Начинаем создание новой игры
+        session['creating_new_game'] = True
+        session['new_game_data'] = {}
+        session['character_creation_step'] = 0
         
-        message = (
-            "🎮 Новая игра начата! Опишите, в какую ролевую игру хотите играть.\n\n"
-            "Например:\n"
-            "• 'Хочу быть эльфом-магом в фэнтези мире'\n"
-            "• 'Начнем космическую оперу, я капитан корабля'\n"
-            "• 'Детектив в Нью-Йорке 1940-х годов'"
-        )
+        message = """
+🎮 **Создание новой ролевой игры**
+
+Сначала определимся с количеством главных персонажей:
+
+**Выберите один из вариантов:**
+        """
         
-        self.send_message(chat_id, message)
+        keyboard = {
+            'inline_keyboard': [
+                [{'text': '👤 Один персонаж', 'callback_data': 'characters_1'}],
+                [{'text': '👥 Несколько персонажей', 'callback_data': 'characters_multiple'}]
+            ]
+        }
+        
+        self.send_message(chat_id, message, keyboard)
     
-    def handle_memory_command(self, chat_id: int, user_id: int):
-        """Обработка команды /memory"""
+    def handle_characters_count(self, chat_id: int, user_id: int, count: str):
+        """Обработка выбора количества персонажей"""
         session = self.get_user_session(user_id)
         
-        memory_context = self.get_memory_context(user_id)
-        if memory_context:
-            message = f"💾 **Память пользователя:**\n{memory_context}\n\nИспользуйте эту информацию в игре!"
+        if count == "1":
+            session['new_game_data']['character_count'] = 1
+            self.ask_character_info(chat_id, user_id, 1)
         else:
-            message = "💾 Память пуста. Загрузите документы или изображения, чтобы они сохранились в памяти."
+            message = """
+👥 **Несколько персонажей**
+
+Укажите точное количество главных персонажей (от 2 до 5):
+            """
+            self.send_message(chat_id, message)
+            session['new_game_data']['waiting_for_count'] = True
+    
+    def ask_character_info(self, chat_id: int, user_id: int, character_number: int):
+        """Запрос информации о персонаже"""
+        session = self.get_user_session(user_id)
+        total_chars = session['new_game_data'].get('character_count', 1)
+        
+        if character_number == 1:
+            session['new_game_data']['characters'] = []
+        
+        message = f"""
+👤 **Персонаж {character_number}/{total_chars}**
+
+Пожалуйста, опишите своего персонажа по следующему шаблону:
+
+**Имя:** [Имя персонажа]
+**Описание:** [Внешность, возраст, пол]
+**Черты характера:** [Личность, особенности]
+**Предыстория:** [История персонажа, откуда он]
+
+Пример:
+**Имя:** Эльриэль Звездокрылая
+**Описание:** Молодая эльфийка 120 лет, высокая и грациозная, с серебристыми волосами
+**Черты характера:** Мудрая, но импульсивная, любит природу и магию
+**Предыстория:** Выросла в лесном королевстве, изучает древнюю магию
+        """
+        
+        session['character_creation_step'] = character_number
+        self.send_message(chat_id, message)
+    
+    def parse_character_info(self, text: str) -> Optional[Dict]:
+        """Парсинг информации о персонаже"""
+        try:
+            lines = text.strip().split('\n')
+            character = {'name': '', 'description': '', 'traits': '', 'backstory': ''}
+            
+            current_field = None
+            for line in lines:
+                line = line.strip()
+                if line.startswith('**Имя:**'):
+                    character['name'] = line.replace('**Имя:**', '').strip()
+                    current_field = 'name'
+                elif line.startswith('**Описание:**'):
+                    character['description'] = line.replace('**Описание:**', '').strip()
+                    current_field = 'description'
+                elif line.startswith('**Черты характера:**') or line.startswith('**Черты:**'):
+                    character['traits'] = line.replace('**Черты характера:**', '').replace('**Черты:**', '').strip()
+                    current_field = 'traits'
+                elif line.startswith('**Предыстория:**'):
+                    character['backstory'] = line.replace('**Предыстория:**', '').strip()
+                    current_field = 'backstory'
+                elif line and current_field and not line.startswith('**'):
+                    # Продолжение текущего поля
+                    character[current_field] += ' ' + line
+            
+            # Проверяем обязательные поля
+            if character['name'] and character['description']:
+                return character
+            return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка парсинга персонажа: {e}")
+            return None
+    
+    def ask_game_description(self, chat_id: int, user_id: int):
+        """Запрос описания игры"""
+        session = self.get_user_session(user_id)
+        character_count = session['new_game_data'].get('character_count', 1)
+        
+        characters_text = ""
+        for i, char in enumerate(session['new_game_data']['characters'], 1):
+            characters_text += f"\n{i}. **{char['name']}** - {char['description']}"
+        
+        message = f"""
+🎲 **Финальный этап создания игры**
+
+Ваши персонажи:{characters_text}
+
+Теперь опишите:
+
+**1. Общее описание истории и мира:**
+[Опишите сеттинг, основную историю, конфликт]
+
+**2. Теги игры:**
+[Укажите жанр и ключевые слова через запятую]
+
+Пример:
+**Описание:** Группа авантюристов исследует заброшенный замок, полный магических ловушек и древних секретов. Их цель - найти артефакт, способный остановить надвигающуюся войну.
+
+**Теги:** фэнтези, приключения, магия, подземелья, артефакт
+        """
+        
+        self.send_message(chat_id, message)
+        session['new_game_data']['waiting_for_description'] = True
+    
+    def create_new_game(self, chat_id: int, user_id: int, description: str, tags: str):
+        """Создание новой игры"""
+        session = self.get_user_session(user_id)
+        
+        try:
+            # Парсим описание и теги
+            lines = description.strip().split('\n')
+            game_description = ""
+            game_tags = []
+            
+            for line in lines:
+                line = line.strip()
+                if line.startswith('**Описание:**') or line.startswith('**1.'):
+                    game_description = line.split(':', 1)[-1].strip()
+                elif line.startswith('**Теги:**') or line.startswith('**2.'):
+                    tags_text = line.split(':', 1)[-1].strip()
+                    game_tags = [tag.strip() for tag in tags_text.split(',')]
+                elif game_description and not line.startswith('**'):
+                    game_description += ' ' + line
+            
+            if not game_description:
+                game_description = description
+            if not game_tags:
+                game_tags = tags.split(',') if tags else ['ролевая игра']
+            
+            # Создаем уникальный ID игры
+            game_id = f"game_{user_id}_{int(time.time())}"
+            
+            # Создаем игру
+            characters = session['new_game_data']['characters']
+            char_names = [char['name'] for char in characters]
+            game_title = f"Приключения {', '.join(char_names)}"
+            
+            game = RoleplayGame(game_id, game_title, game_description, game_tags)
+            
+            # Добавляем персонажей
+            for char_data in characters:
+                character = Character(
+                    char_data['name'],
+                    char_data['description'],
+                    char_data['traits'],
+                    char_data['backstory']
+                )
+                game.characters.append(character)
+            
+            # Деактивируем другие игры
+            if user_id not in self.saved_games:
+                self.saved_games[user_id] = []
+            
+            for existing_game in self.saved_games[user_id]:
+                existing_game.is_active = False
+            
+            # Активируем новую игру
+            game.is_active = True
+            self.saved_games[user_id].append(game)
+            
+            # Создаем начальный чекпоинт
+            initial_messages = [{"role": "system", "content": f"Создана новая игра: {game_title}"}]
+            checkpoint_pdf = self.create_checkpoint_pdf(game, initial_messages)
+            
+            if checkpoint_pdf:
+                checkpoint_uri = self.upload_file_to_google(
+                    checkpoint_pdf, 
+                    f"checkpoint_{game_id}.pdf", 
+                    "application/pdf"
+                )
+                game.checkpoint_file_uri = checkpoint_uri
+            
+            # Сохраняем игры
+            self.save_games_to_file()
+            
+            # Очищаем данные создания
+            session['creating_new_game'] = False
+            session['new_game_data'] = {}
+            session['character_creation_step'] = 0
+            session['chat_history'] = []
+            
+            # Генерируем начальное сообщение
+            self.start_roleplay(chat_id, user_id, game)
+            
+        except Exception as e:
+            logger.error(f"Ошибка создания игры: {e}")
+            self.send_message(chat_id, f"❌ Ошибка создания игры: {e}")
+    
+    def start_roleplay(self, chat_id: int, user_id: int, game: RoleplayGame):
+        """Начало ролевой игры"""
+        try:
+            # Формируем контекст для начала игры
+            context = f"""{self.system_prompt}
+
+НОВАЯ РОЛЕВАЯ ИГРА: {game.title}
+
+ОПИСАНИЕ МИРА И ИСТОРИИ:
+{game.description}
+
+ПЕРСОНАЖИ:"""
+            
+            for char in game.characters:
+                context += f"""
+
+{char.name}:
+- Описание: {char.description}
+- Черты характера: {char.traits}
+- Предыстория: {char.backstory}"""
+            
+            context += f"""
+
+ТЕГИ: {', '.join(game.tags)}
+
+Нейкон, начни эту ролевую игру! Создай захватывающую начальную сцену, которая введет персонажей в мир и покажет основной конфликт или задачу. Обращайся к персонажам по именам и учитывай их характеристики."""
+            
+            # Если есть чекпоинт, используем его
+            file_uris = []
+            if game.checkpoint_file_uri:
+                file_uris.append(game.checkpoint_file_uri)
+            
+            if file_uris:
+                response = self.generate_with_files(context, file_uris)
+            else:
+                response = self.model.generate_content(context).text.strip()
+            
+            # Добавляем задержку
+            time.sleep(5)
+            
+            # Сохраняем в историю
+            session = self.get_user_session(user_id)
+            session['chat_history'].append({"role": "assistant", "content": response})
+            
+            # Отправляем сообщение
+            success_message = f"""
+✅ **Игра "{game.title}" создана и запущена!**
+
+🎮 **Ваши персонажи:** {', '.join([char.name for char in game.characters])}
+🏷️ **Теги:** {', '.join(game.tags)}
+
+---
+"""
+            
+            self.send_message(chat_id, success_message + response)
+            
+        except Exception as e:
+            logger.error(f"Ошибка начала игры: {e}")
+            self.send_message(chat_id, f"❌ Ошибка начала игры: {e}")
+    
+    def handle_games_command(self, chat_id: int, user_id: int):
+        """Обработка команды /games"""
+        saved_games = self.saved_games.get(user_id, [])
+        
+        if not saved_games:
+            message = """
+📚 **Список игр пуст**
+
+У вас пока нет сохраненных ролевых игр. Создайте новую игру командой /new
+            """
+            keyboard = {
+                'inline_keyboard': [
+                    [{'text': '🎮 Создать новую игру', 'callback_data': 'new_game'}]
+                ]
+            }
+            self.send_message(chat_id, message, keyboard)
+            return
+        
+        message = "📚 **Ваши ролевые игры:**\n\n"
+        keyboard_buttons = []
+        
+        for i, game in enumerate(saved_games):
+            status = "🟢 Активна" if game.is_active else "⚪ Неактивна"
+            characters = ', '.join([char.name for char in game.characters])
+            
+            message += f"""
+**{i+1}. {game.title}** {status}
+👥 Персонажи: {characters}
+🏷️ Теги: {', '.join(game.tags)}
+📅 Создана: {game.created_at.strftime('%d.%m.%Y')}
+📝 Описание: {game.description[:100]}{'...' if len(game.description) > 100 else ''}
+
+"""
+            
+            # Добавляем кнопки для игры
+            if game.is_active:
+                keyboard_buttons.append([
+                    {'text': f'💾 Сохранить "{game.title}"', 'callback_data': f'save_game_{game.game_id}'}
+                ])
+            else:
+                keyboard_buttons.append([
+                    {'text': f'▶️ Продолжить "{game.title}"', 'callback_data': f'load_game_{game.game_id}'}
+                ])
+        
+        keyboard_buttons.append([{'text': '🎮 Новая игра', 'callback_data': 'new_game'}])
+        
+        keyboard = {'inline_keyboard': keyboard_buttons}
+        self.send_message(chat_id, message, keyboard)
+    
+    def save_current_game(self, chat_id: int, user_id: int, game_id: str):
+        """Сохранение текущей игры"""
+        try:
+            session = self.get_user_session(user_id)
+            game = None
+            
+            # Находим игру
+            for g in self.saved_games.get(user_id, []):
+                if g.game_id == game_id:
+                    game = g
+                    break
+            
+            if not game:
+                self.send_message(chat_id, "❌ Игра не найдена")
+                return
+            
+            # Обновляем чекпоинт и чат-лог
+            chat_history = session.get('chat_history', [])
+            
+            if chat_history:
+                # Создаем полный чат-лог
+                chat_log_pdf = self.create_chat_log_pdf(chat_history, game.title)
+                if chat_log_pdf:
+                    log_uri = self.upload_file_to_google(
+                        chat_log_pdf,
+                        f"chat_log_{game_id}_{int(time.time())}.pdf",
+                        "application/pdf"
+                    )
+                    game.chat_log_file_uri = log_uri
+                
+                # Создаем чекпоинт
+                checkpoint_pdf = self.create_checkpoint_pdf(game, chat_history)
+                if checkpoint_pdf:
+                    checkpoint_uri = self.upload_file_to_google(
+                        checkpoint_pdf,
+                        f"checkpoint_{game_id}_{int(time.time())}.pdf",
+                        "application/pdf"
+                    )
+                    game.checkpoint_file_uri = checkpoint_uri
+            
+            # Деактивируем игру
+            game.is_active = False
+            game.last_updated = datetime.now()
+            
+            # Сохраняем в файл
+            self.save_games_to_file()
+            
+            # Очищаем сессию
+            session['chat_history'] = []
+            
+            self.send_message(chat_id, f"💾 Игра \"{game.title}\" сохранена! Все прогресс и персонажи сохранены в памяти.")
+            
+        except Exception as e:
+            logger.error(f"Ошибка сохранения игры: {e}")
+            self.send_message(chat_id, f"❌ Ошибка сохранения: {e}")
+    
+    def load_game(self, chat_id: int, user_id: int, game_id: str):
+        """Загрузка игры"""
+        try:
+            # Деактивируем текущие игры
+            for game in self.saved_games.get(user_id, []):
+                game.is_active = False
+            
+            # Активируем выбранную игру
+            game = None
+            for g in self.saved_games.get(user_id, []):
+                if g.game_id == game_id:
+                    game = g
+                    game.is_active = True
+                    break
+            
+            if not game:
+                self.send_message(chat_id, "❌ Игра не найдена")
+                return
+            
+            # Очищаем текущую сессию
+            session = self.get_user_session(user_id)
+            session['chat_history'] = []
+            
+            # Формируем приветственное сообщение
+            characters = ', '.join([char.name for char in game.characters])
+            
+            message = f"""
+🎮 **Игра "{game.title}" загружена!**
+
+👥 **Персонажи:** {characters}
+🏷️ **Теги:** {', '.join(game.tags)}
+📅 **Последнее обновление:** {game.last_updated.strftime('%d.%m.%Y %H:%M')}
+
+📝 **Описание:** {game.description}
+
+Игра восстановлена из памяти! Продолжайте свое приключение.
+            """
+            
+            self.send_message(chat_id, message)
+            
+            # Сохраняем изменения
+            self.save_games_to_file()
+            
+        except Exception as e:
+            logger.error(f"Ошибка загрузки игры: {e}")
+            self.send_message(chat_id, f"❌ Ошибка загрузки: {e}")
+
+    def handle_memory_command(self, chat_id: int, user_id: int):
+        """Обработка команды /memory"""
+        active_game = self.get_active_game(user_id)
+        
+        if not active_game:
+            self.send_message(chat_id, "💾 Нет активной игры. Загрузите игру из списка или создайте новую.")
+            return
+        
+        message = f"""
+💾 **Память активной игры: {active_game.title}**
+
+👥 **Персонажи:**
+"""
+        
+        for char in active_game.characters:
+            message += f"""
+**{char.name}**
+- Описание: {char.description}
+- Черты: {char.traits}
+- Предыстория: {char.backstory}
+"""
+            if char.current_state:
+                message += f"- Текущее состояние: {char.current_state}\n"
+        
+        message += f"""
+🏷️ **Теги:** {', '.join(active_game.tags)}
+📝 **Описание мира:** {active_game.description}
+
+📄 **Файлы памяти:**
+"""
+        
+        if active_game.chat_log_file_uri:
+            message += "✅ Полный чат-лог сохранен\n"
+        else:
+            message += "❌ Чат-лог не создан\n"
+            
+        if active_game.checkpoint_file_uri:
+            message += "✅ Чекпоинт сохранен\n"
+        else:
+            message += "❌ Чекпоинт не создан\n"
         
         self.send_message(chat_id, message)
     
@@ -384,115 +1108,34 @@ class SimpleTelegramBot:
             self.handle_new_command(chat_id, user_id)
         elif callback_data == "help":
             self.handle_help_command(chat_id)
+        elif callback_data == "my_games":
+            self.handle_games_command(chat_id, user_id)
+        elif callback_data == "characters_1":
+            self.handle_characters_count(chat_id, user_id, "1")
+        elif callback_data == "characters_multiple":
+            self.handle_characters_count(chat_id, user_id, "multiple")
+        elif callback_data.startswith("save_game_"):
+            game_id = callback_data.replace("save_game_", "")
+            self.save_current_game(chat_id, user_id, game_id)
+        elif callback_data.startswith("load_game_"):
+            game_id = callback_data.replace("load_game_", "")
+            self.load_game(chat_id, user_id, game_id)
     
     def handle_photo(self, message):
         """Обработка загруженного изображения"""
         chat_id = message['chat']['id']
         user_id = message['from']['id']
-        user_name = message['from'].get('first_name', 'Пользователь')
-        photos = message['photo']
-        caption = message.get('caption', '')
         
-        # Получаем фото с максимальным разрешением (последний элемент в массиве)
-        photo = photos[-1]
-        file_id = photo['file_id']
-        file_size = photo.get('file_size', 0)
-        
-        # Проверяем размер файла (максимум 5MB для экономии токенов)
-        if file_size > 5 * 1024 * 1024:
-            self.send_message(chat_id, "❌ Фото слишком большое. Максимальный размер: 5MB")
-            return
-        
-        # Отправляем статус обработки
-        self.send_message(chat_id, f"🖼️ Анализирую изображение...")
-        self.send_chat_action(chat_id, "typing")
-        
-        try:
-            # Получаем информацию о файле
-            file_info = self.get_file(file_id)
-            if not file_info or not file_info.get('ok'):
-                self.send_message(chat_id, "❌ Не удалось получить информацию о фото")
-                return
-            
-            file_path = file_info['result']['file_path']
-            
-            # Скачиваем файл
-            file_content = self.download_file(file_path)
-            if not file_content:
-                self.send_message(chat_id, "❌ Не удалось скачать фото")
-                return
-            
-            # Обновляем сессию пользователя
-            session = self.get_user_session(user_id)
-            session['last_activity'] = datetime.now()
-            
-            # Сохраняем изображение в память
-            image_info = {
-                'name': f"image_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg",
-                'description': caption if caption else "Изображение для ролевой игры"
-            }
-            self.save_file_to_memory(user_id, image_info, file_content, 'image')
-            
-            # Формируем контекст для анализа изображения
-            context_text = self.system_prompt + "\n\n"
-            context_text += "Пользователь отправил изображение для анализа в контексте ролевой игры.\n\n"
-            
-            if caption:
-                context_text += f"Описание пользователя: {caption}\n\n"
-                context_text += "Нейкон, проанализируй это изображение с учетом описания пользователя и интегрируй его в ролевую игру. Опиши, что ты видишь, и как это может повлиять на игровой процесс."
-            else:
-                context_text += "Нейкон, проанализируй это изображение и интегрируй его в ролевую игру. Опиши, что ты видишь, и как это может повлиять на игровой процесс."
-            
-            # Создаем модель для работы с изображениями
-            try:
-                vision_model = genai.GenerativeModel('gemini-2.5-pro')
-                
-                # Создаем изображение для Gemini
-                import io
-                from PIL import Image
-                
-                image = Image.open(io.BytesIO(file_content))
-                
-                # Отправляем изображение и текст в Gemini
-                response = vision_model.generate_content([context_text, image])
-                analysis = response.text.strip()
-                
-                # Добавляем длительную задержку для избежания превышения квоты
-                time.sleep(10)
-                
-                # Добавляем информацию о фото в историю
-                photo_description = f"Отправлено изображение{f' с описанием: {caption}' if caption else ''}"
-                session['chat_history'].append({
-                    "role": "user", 
-                    "content": photo_description
-                })
-                
-                # Добавляем анализ в историю
-                session['chat_history'].append({"role": "assistant", "content": analysis})
-                
-                # Ограничиваем длину истории для экономии токенов
-                if len(session['chat_history']) > 10:
-                    session['chat_history'] = session['chat_history'][-10:]
-                
-                # Отправляем анализ
-                self.send_message(chat_id, f"🖼️ **Анализ изображения:**\n\n{analysis}")
-                
-            except ImportError:
-                # Если PIL не установлен, отправляем сообщение об ошибке
-                self.send_message(chat_id, 
-                    "❌ Для анализа изображений нужна библиотека Pillow. Установите: pip install Pillow")
-                return
-                
-        except Exception as e:
-            logger.error(f"Ошибка при обработке изображения: {e}")
-            
-            # Проверяем ошибку квоты
-            if "429" in str(e) or "quota" in str(e).lower():
-                self.send_message(chat_id, 
-                    "⚠️ Превышен лимит запросов к Gemini API. Попробуйте через несколько минут.")
-            else:
-                self.send_message(chat_id, 
-                    "❌ Произошла ошибка при обработке изображения. Попробуйте позже.")
+        self.send_message(chat_id, """
+🖼️ **Изображения временно не поддерживаются**
+
+В новой версии бота сосредоточены на:
+- PDF документах для памяти игры
+- Продвинутой системе персонажей
+- Сохранении ролевых игр
+
+Используйте PDF файлы для лучшей интеграции с системой памяти!
+        """)
     
     def handle_document(self, message):
         """Обработка загруженного документа"""
@@ -505,14 +1148,14 @@ class SimpleTelegramBot:
         file_id = document['file_id']
         file_size = document.get('file_size', 0)
         
-        # Проверяем размер файла (максимум 5MB для экономии токенов)
-        if file_size > 5 * 1024 * 1024:
-            self.send_message(chat_id, "❌ Файл слишком большой. Максимальный размер: 5MB")
+        # Проверяем размер файла (максимум 20MB)
+        if file_size > 20 * 1024 * 1024:
+            self.send_message(chat_id, "❌ Файл слишком большой. Максимальный размер: 20MB")
             return
         
         # Отправляем статус обработки
-        self.send_message(chat_id, f"📄 Обрабатываю документ: {file_name}")
-        self.send_chat_action(chat_id, "typing")
+        self.send_message(chat_id, f"📄 Загружаю документ в память игры: {file_name}")
+        self.send_chat_action(chat_id, "upload_document")
         
         try:
             # Получаем информацию о файле
@@ -529,58 +1172,56 @@ class SimpleTelegramBot:
                 self.send_message(chat_id, "❌ Не удалось скачать файл")
                 return
             
-            # Извлекаем текст из документа
-            document_text = self.extract_text_from_document(file_content, file_name)
+            # Загружаем файл в Google Files API
+            file_uri = self.upload_file_to_google(file_content, file_name, "application/pdf")
             
-            if document_text.startswith("Ошибка") or document_text.startswith("Неподдерживаемый"):
-                self.send_message(chat_id, document_text)
+            if not file_uri:
+                self.send_message(chat_id, "❌ Не удалось загрузить файл в память")
                 return
             
-            # Обновляем сессию пользователя
-            session = self.get_user_session(user_id)
-            session['last_activity'] = datetime.now()
+            # Проверяем активную игру
+            active_game = self.get_active_game(user_id)
             
-            # Сохраняем документ в память
-            file_info = {
-                'name': file_name,
-                'description': f"Документ содержит: {document_text[:200]}...",
-                'text_content': document_text
-            }
-            self.save_file_to_memory(user_id, file_info, file_content, 'document')
+            if not active_game:
+                # Если нет активной игры, начинаем создание новой
+                session = self.get_user_session(user_id)
+                session['uploaded_document_uri'] = file_uri
+                session['uploaded_document_name'] = file_name
+                
+                message = f"""
+📄 **Документ "{file_name}" загружен в память!**
+
+У вас нет активной ролевой игры. Хотите создать новую игру на основе этого документа?
+
+Документ будет использован как основа для мира и истории.
+                """
+                
+                keyboard = {
+                    'inline_keyboard': [
+                        [{'text': '🎮 Создать игру на основе документа', 'callback_data': 'new_game'}],
+                        [{'text': '📚 Показать мои игры', 'callback_data': 'my_games'}]
+                    ]
+                }
+                
+                self.send_message(chat_id, message, keyboard)
+                return
             
-            # Добавляем информацию о документе в историю
-            session['chat_history'].append({
-                "role": "user", 
-                "content": f"Загружен документ '{file_name}':\n\n{document_text[:1000]}{'...' if len(document_text) > 1000 else ''}"
-            })
-            
-            # Ограничиваем длину истории для экономии токенов
-            if len(session['chat_history']) > 10:
-                session['chat_history'] = session['chat_history'][-10:]
-            
-            # Ограничиваем размер текста для экономии токенов
-            max_text_length = 2000  # Ограничиваем до 2000 символов
-            if len(document_text) > max_text_length:
-                document_text = document_text[:max_text_length] + "..."
-            
-            # Формируем контекст для анализа
-            context_text = self.system_prompt + "\n\n"
-            context_text += f"Пользователь загрузил документ '{file_name}' для анализа.\n\n"
-            context_text += f"Содержимое документа:\n{document_text}\n\n"
-            context_text += "Нейкон, проанализируй этот документ и дай краткий ответ с рекомендациями."
-            
-            # Отправляем в Gemini для анализа с текстом документа
-            response = self.model.generate_content(context_text)
-            analysis = response.text.strip()
-            
-            # Добавляем длительную задержку для избежания превышения квоты
-            time.sleep(10)
-            
-            # Добавляем анализ в историю
-            session['chat_history'].append({"role": "assistant", "content": analysis})
-            
-            # Отправляем анализ
-            self.send_message(chat_id, f"📊 **Анализ документа '{file_name}':**\n\n{analysis}")
+            # Если есть активная игра, добавляем документ в её память
+            if file_name.lower().endswith('.pdf'):
+                # Обновляем чат-лог или чекпоинт
+                if 'chat' in file_name.lower() or 'log' in file_name.lower():
+                    active_game.chat_log_file_uri = file_uri
+                    message = f"📚 Документ \"{file_name}\" добавлен как чат-лог к игре \"{active_game.title}\""
+                else:
+                    active_game.checkpoint_file_uri = file_uri
+                    message = f"💾 Документ \"{file_name}\" добавлен как чекпоинт к игре \"{active_game.title}\""
+                
+                # Сохраняем изменения
+                self.save_games_to_file()
+                
+                self.send_message(chat_id, f"✅ {message}\n\nТеперь вся память игры доступна для ролевой игры!")
+            else:
+                self.send_message(chat_id, "⚠️ Рекомендуется использовать PDF файлы для лучшей совместимости с системой памяти.")
             
         except Exception as e:
             logger.error(f"Ошибка при обработке документа: {e}")
@@ -588,10 +1229,7 @@ class SimpleTelegramBot:
             # Проверяем ошибку квоты
             if "429" in str(e) or "quota" in str(e).lower():
                 self.send_message(chat_id, 
-                    "⚠️ Превышен лимит запросов к Gemini API. Попробуйте через несколько минут.")
-            elif "format" in str(e).lower() or "type" in str(e).lower():
-                self.send_message(chat_id, 
-                    "❌ Ошибка формата файла. Попробуйте другой документ.")
+                    "⚠️ Превышен лимит запросов к Google API. Попробуйте через несколько минут.")
             else:
                 self.send_message(chat_id, 
                     "❌ Произошла ошибка при обработке документа. Попробуйте позже.")
@@ -606,6 +1244,11 @@ class SimpleTelegramBot:
         # Обновляем время последней активности
         session = self.get_user_session(user_id)
         session['last_activity'] = datetime.now()
+        
+        # Проверяем, создается ли новая игра
+        if session.get('creating_new_game'):
+            self.handle_game_creation_message(chat_id, user_id, text)
+            return
         
         # Добавляем сообщение пользователя в историю
         session['chat_history'].append({"role": "user", "content": text})
@@ -624,31 +1267,67 @@ class SimpleTelegramBot:
                     "Проверьте настройки API ключа.")
                 return
             
-            # Формируем контекст
-            context_text = self.system_prompt + "\n\n"
+            # Получаем активную игру
+            active_game = self.get_active_game(user_id)
             
-            # Добавляем контекст памяти (сохраненные файлы и изображения)
-            memory_context = self.get_memory_context(user_id)
-            if memory_context:
-                context_text += "💾 ПАМЯТЬ ПОЛЬЗОВАТЕЛЯ:" + memory_context + "\n\n"
+            if not active_game:
+                # Нет активной игры - предлагаем создать
+                self.send_message(chat_id, 
+                    "🎮 У вас нет активной ролевой игры. Создайте новую игру командой /new или выберите из сохраненных /games")
+                return
+            
+            # Формируем контекст для ролевой игры
+            context_text = f"{self.system_prompt}\n\n"
+            context_text += f"АКТИВНАЯ ИГРА: {active_game.title}\n"
+            context_text += f"ОПИСАНИЕ МИРА: {active_game.description}\n\n"
+            
+            # Добавляем информацию о персонажах
+            context_text += "ПЕРСОНАЖИ:\n"
+            for char in active_game.characters:
+                context_text += f"- {char.name}: {char.description}\n"
+                context_text += f"  Черты: {char.traits}\n"
+                if char.current_state:
+                    context_text += f"  Состояние: {char.current_state}\n"
+            
+            context_text += f"\nТЕГИ: {', '.join(active_game.tags)}\n\n"
             
             # Добавляем историю диалога
-            for msg in session['chat_history'][:-1]:
+            context_text += "ИСТОРИЯ ДИАЛОГА:\n"
+            for msg in session['chat_history'][:-5]:  # Старые сообщения
                 if msg["role"] == "user":
-                    context_text += f"Пользователь: {msg['content']}\n"
+                    context_text += f"Игрок: {msg['content']}\n"
                 else:
                     context_text += f"Нейкон: {msg['content']}\n"
             
-            # Добавляем текущее сообщение
-            context_text += f"Пользователь: {text}\n"
+            # Последние 5 сообщений для контекста
+            recent_messages = session['chat_history'][-5:]
+            context_text += "\nПОСЛЕДНИЕ СОБЫТИЯ:\n"
+            for msg in recent_messages[:-1]:
+                if msg["role"] == "user":
+                    context_text += f"Игрок: {msg['content']}\n"
+                else:
+                    context_text += f"Нейкон: {msg['content']}\n"
+            
+            # Текущее сообщение
+            context_text += f"\nИгрок: {text}\n"
             context_text += "Нейкон:"
             
-            # Отправляем в Gemini
-            response = self.model.generate_content(context_text)
-            assistant_message = response.text.strip()
+            # Собираем файлы памяти для подключения
+            file_uris = []
+            if active_game.chat_log_file_uri:
+                file_uris.append(active_game.chat_log_file_uri)
+            if active_game.checkpoint_file_uri:
+                file_uris.append(active_game.checkpoint_file_uri)
             
-            # Добавляем длительную задержку для избежания превышения квоты
-            time.sleep(5)
+            # Отправляем запрос с подключенными файлами памяти
+            if file_uris:
+                assistant_message = self.generate_with_files(context_text, file_uris)
+            else:
+                response = self.model.generate_content(context_text)
+                assistant_message = response.text.strip()
+            
+            # Добавляем задержку для экономии квоты
+            time.sleep(3)
             
             # Добавляем ответ в историю
             session['chat_history'].append({"role": "assistant", "content": assistant_message})
@@ -667,11 +1346,56 @@ class SimpleTelegramBot:
                 self.send_message(chat_id, 
                     "❌ Произошла ошибка при обработке сообщения. Попробуйте позже.")
     
+    def handle_game_creation_message(self, chat_id: int, user_id: int, text: str):
+        """Обработка сообщений во время создания игры"""
+        session = self.get_user_session(user_id)
+        
+        # Ожидание количества персонажей
+        if session['new_game_data'].get('waiting_for_count'):
+            try:
+                count = int(text.strip())
+                if 2 <= count <= 5:
+                    session['new_game_data']['character_count'] = count
+                    session['new_game_data']['waiting_for_count'] = False
+                    self.ask_character_info(chat_id, user_id, 1)
+                else:
+                    self.send_message(chat_id, "❌ Количество персонажей должно быть от 2 до 5. Попробуйте еще раз:")
+            except ValueError:
+                self.send_message(chat_id, "❌ Введите число от 2 до 5:")
+            return
+        
+        # Создание персонажа
+        if session['character_creation_step'] > 0:
+            character_data = self.parse_character_info(text)
+            if character_data:
+                session['new_game_data']['characters'].append(character_data)
+                current_step = session['character_creation_step']
+                total_chars = session['new_game_data']['character_count']
+                
+                if current_step < total_chars:
+                    # Переходим к следующему персонажу
+                    self.ask_character_info(chat_id, user_id, current_step + 1)
+                else:
+                    # Все персонажи созданы, запрашиваем описание игры
+                    self.ask_game_description(chat_id, user_id)
+                    session['character_creation_step'] = 0
+            else:
+                self.send_message(chat_id, "❌ Не удалось распознать информацию о персонаже. Проверьте формат и попробуйте еще раз:")
+            return
+        
+        # Ожидание описания игры
+        if session['new_game_data'].get('waiting_for_description'):
+            self.create_new_game(chat_id, user_id, text, "")
+            return
+    
     def process_update(self, update):
         """Обработка обновления"""
         if 'message' in update:
             message = update['message']
             text = message.get('text', '')
+            chat_id = message['chat']['id']
+            user_id = message['from']['id']
+            user_name = message['from'].get('first_name', 'Пользователь')
             
             # Проверяем наличие документа
             if 'document' in message:
@@ -680,14 +1404,15 @@ class SimpleTelegramBot:
             elif 'photo' in message:
                 self.handle_photo(message)
             elif text.startswith('/start'):
-                self.handle_start_command(message['chat']['id'], 
-                                       message['from'].get('first_name', 'Пользователь'))
+                self.handle_start_command(chat_id, user_id, user_name)
             elif text.startswith('/help'):
-                self.handle_help_command(message['chat']['id'])
+                self.handle_help_command(chat_id)
             elif text.startswith('/new'):
-                self.handle_new_command(message['chat']['id'], message['from']['id'])
+                self.handle_new_command(chat_id, user_id)
+            elif text.startswith('/games'):
+                self.handle_games_command(chat_id, user_id)
             elif text.startswith('/memory'):
-                self.handle_memory_command(message['chat']['id'], message['from']['id'])
+                self.handle_memory_command(chat_id, user_id)
             else:
                 self.handle_message(message)
         
