@@ -186,22 +186,54 @@ class SimpleTelegramBot:
         except Exception as e:
             logger.error(f"Ошибка сохранения игр: {e}")
     
-    def upload_file_to_google(self, file_content: bytes, file_name: str, mime_type: str) -> Optional[str]:
+    def get_mime_type(self, file_name: str) -> str:
+        """Определение MIME-типа по расширению файла"""
+        file_ext = file_name.lower().split('.')[-1] if '.' in file_name else ''
+        
+        mime_types = {
+            'pdf': 'application/pdf',
+            'txt': 'text/plain',
+            'md': 'text/markdown',
+            'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'doc': 'application/msword',
+            'jpg': 'image/jpeg',
+            'jpeg': 'image/jpeg',
+            'png': 'image/png',
+            'gif': 'image/gif',
+            'json': 'application/json'
+        }
+        
+        return mime_types.get(file_ext, 'application/octet-stream')
+    
+    def upload_file_to_google(self, file_content: bytes, file_name: str, mime_type: str = None) -> Optional[str]:
         """Загрузка файла в Google Files API"""
         try:
-            # Создаем временный файл
-            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            # Определяем MIME-тип если не передан
+            if not mime_type:
+                mime_type = self.get_mime_type(file_name)
+            
+            logger.info(f"Загружаем файл {file_name} с MIME-типом: {mime_type}")
+            
+            # Создаем временный файл с правильным расширением
+            file_ext = file_name.lower().split('.')[-1] if '.' in file_name else 'bin'
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_ext}') as temp_file:
                 temp_file.write(file_content)
                 temp_file_path = temp_file.name
             
             try:
-                # Загружаем файл через genai
-                uploaded_file = genai.upload_file(temp_file_path, display_name=file_name)
-                logger.info(f"Файл {file_name} загружен: {uploaded_file.uri}")
+                # Загружаем файл через genai с указанием MIME-типа
+                uploaded_file = genai.upload_file(
+                    temp_file_path, 
+                    display_name=file_name,
+                    mime_type=mime_type
+                )
+                logger.info(f"✅ Файл {file_name} успешно загружен: {uploaded_file.uri}")
                 return uploaded_file.uri
             finally:
                 # Удаляем временный файл
-                os.unlink(temp_file_path)
+                if os.path.exists(temp_file_path):
+                    os.unlink(temp_file_path)
                 
         except Exception as e:
             logger.error(f"Ошибка загрузки файла в Google API: {e}")
@@ -382,7 +414,7 @@ class SimpleTelegramBot:
         except Exception as e:
             logger.error(f"Ошибка создания чекпоинта: {e}")
             return None
-
+    
     def get_user_session(self, user_id: int) -> Dict:
         """Получение или создание сессии пользователя"""
         if user_id not in self.user_sessions:
@@ -423,7 +455,12 @@ class SimpleTelegramBot:
         return False
     
     def send_message(self, chat_id: int, text: str, reply_markup=None):
-        """Отправка сообщения через Telegram API"""
+        """Отправка сообщения через Telegram API с поддержкой длинных сообщений"""
+        # Максимальная длина сообщения в Telegram
+        MAX_MESSAGE_LENGTH = 4096
+        
+        if len(text) <= MAX_MESSAGE_LENGTH:
+            # Обычное сообщение
         url = f"{self.base_url}{self.telegram_token}/sendMessage"
         data = {
             'chat_id': chat_id,
@@ -439,6 +476,82 @@ class SimpleTelegramBot:
         except Exception as e:
             logger.error(f"Ошибка отправки сообщения: {e}")
             return None
+        else:
+            # Разбиваем длинное сообщение на части
+            parts = self.split_long_message(text, MAX_MESSAGE_LENGTH)
+            responses = []
+            
+            for i, part in enumerate(parts):
+                # Кнопки добавляем только к последней части
+                markup = reply_markup if i == len(parts) - 1 else None
+                
+                url = f"{self.base_url}{self.telegram_token}/sendMessage"
+                data = {
+                    'chat_id': chat_id,
+                    'text': part,
+                    'parse_mode': 'Markdown'
+                }
+                if markup:
+                    data['reply_markup'] = json.dumps(markup)
+                
+                try:
+                    response = requests.post(url, json=data)
+                    responses.append(response.json())
+                    # Небольшая задержка между сообщениями
+                    time.sleep(0.5)
+                except Exception as e:
+                    logger.error(f"Ошибка отправки части сообщения: {e}")
+            
+            return responses
+    
+    def split_long_message(self, text: str, max_length: int) -> List[str]:
+        """Разбивает длинное сообщение на части"""
+        if len(text) <= max_length:
+            return [text]
+        
+        parts = []
+        current_part = ""
+        
+        # Разбиваем по абзацам
+        paragraphs = text.split('\n\n')
+        
+        for paragraph in paragraphs:
+            # Если даже один абзац слишком длинный
+            if len(paragraph) > max_length:
+                # Если уже есть накопленный текст, добавляем его
+                if current_part:
+                    parts.append(current_part.strip())
+                    current_part = ""
+                
+                # Разбиваем длинный абзац по предложениям
+                sentences = paragraph.split('. ')
+                temp_part = ""
+                
+                for sentence in sentences:
+                    if len(temp_part + sentence + '. ') <= max_length:
+                        temp_part += sentence + '. '
+                    else:
+                        if temp_part:
+                            parts.append(temp_part.strip())
+                        temp_part = sentence + '. '
+                
+                if temp_part:
+                    current_part = temp_part
+            else:
+                # Проверяем, поместится ли абзац в текущую часть
+                if len(current_part + paragraph + '\n\n') <= max_length:
+                    current_part += paragraph + '\n\n'
+                else:
+                    # Добавляем накопленную часть и начинаем новую
+                    if current_part:
+                        parts.append(current_part.strip())
+                    current_part = paragraph + '\n\n'
+        
+        # Добавляем последнюю часть
+        if current_part:
+            parts.append(current_part.strip())
+        
+        return parts
     
     def generate_with_files(self, prompt: str, file_uris: List[str]) -> str:
         """Генерация ответа с подключенными файлами"""
@@ -662,6 +775,125 @@ class SimpleTelegramBot:
             self.send_message(chat_id, message)
             session['new_game_data']['waiting_for_count'] = True
     
+    def create_game_from_document(self, chat_id: int, user_id: int, document_uri: str, document_name: str):
+        """Создание игры на основе загруженного документа"""
+        try:
+            self.send_message(chat_id, "🎮 **Создаю игру на основе документа...**\n\nАнализирую содержимое документа и создаю ролевую игру.")
+            self.send_chat_action(chat_id, "typing")
+            
+            # Формируем промпт для анализа документа и создания игры
+            analysis_prompt = f"""
+{self.system_prompt}
+
+ЗАДАЧА: Проанализируй загруженный документ "{document_name}" и автоматически создай на его основе ролевую игру.
+
+ИНСТРУКЦИИ:
+1. Внимательно изучи содержимое документа
+2. Определи жанр и сеттинг на основе содержимого
+3. Извлеки или создай персонажей (1-3 главных героя)
+4. Создай захватывающую начальную сцену
+5. Определи основной конфликт или цель
+
+ФОРМАТ ОТВЕТА:
+🎮 **Ролевая игра создана: [Название]**
+
+**📖 Жанр и сеттинг:**
+[Описание мира и жанра на основе документа]
+
+**👥 Главные персонажи:**
+- **[Имя 1]**: [Описание, роль, особенности]
+- **[Имя 2]**: [Описание, роль, особенности]
+[При необходимости добавь больше персонажей]
+
+**🎯 Основная цель/конфликт:**
+[Главная задача или проблема, которую нужно решить]
+
+**🌟 Начальная сцена:**
+[Подробное описание начальной ситуации, где находятся персонажи, что происходит, создай атмосферу и вовлеки в игру]
+
+**📋 Следующие действия:**
+Теперь ты можешь описать действия своего персонажа или задать вопросы о мире!
+
+Создай интересную и захватывающую игру, используя ВСЕ детали из документа!
+            """
+            
+            # Отправляем запрос с документом
+            response = self.generate_with_files(analysis_prompt, [document_uri])
+            
+            # Добавляем задержку
+            time.sleep(3)
+            
+            # Создаем объект игры на основе ответа
+            game_id = f"doc_game_{user_id}_{int(time.time())}"
+            
+            # Извлекаем название игры из ответа ИИ
+            game_title = "Ролевая игра на основе документа"
+            if "создана:" in response:
+                title_part = response.split("создана:")[1].split("**")[0].strip()
+                if title_part:
+                    game_title = title_part
+            
+            # Создаем игру
+            game = RoleplayGame(
+                game_id, 
+                game_title, 
+                f"Игра создана на основе документа: {document_name}", 
+                ["документ", "автоматическая генерация"]
+            )
+            
+            # Добавляем базового персонажа (ИИ определит детали из ответа)
+            base_character = Character(
+                "Главный герой",
+                "Персонаж, созданный на основе документа",
+                "Определяется по ходу игры",
+                "История из загруженного документа"
+            )
+            game.characters.append(base_character)
+            
+            # Устанавливаем документ как чекпоинт
+            game.checkpoint_file_uri = document_uri
+            
+            # Деактивируем другие игры и активируем новую
+            if user_id not in self.saved_games:
+                self.saved_games[user_id] = []
+            
+            for existing_game in self.saved_games[user_id]:
+                existing_game.is_active = False
+            
+            game.is_active = True
+            self.saved_games[user_id].append(game)
+            
+            # Сохраняем игры
+            self.save_games_to_file()
+            
+            # Очищаем данные загруженного документа и историю
+            session = self.get_user_session(user_id)
+            session['uploaded_document_uri'] = None
+            session['uploaded_document_name'] = None
+            session['chat_history'] = []
+            
+            # Добавляем начальное сообщение в историю
+            session['chat_history'].append({"role": "assistant", "content": response})
+            
+            # Отправляем ответ с информацией о созданной игре
+            final_response = f"""
+✅ **Загрузка завершена!**
+
+📄 **Документ "{document_name}" успешно проанализирован**
+🎮 **Ролевая игра автоматически создана и запущена**
+💾 **Документ сохранен в памяти игры**
+
+---
+
+{response}
+            """
+            
+            self.send_message(chat_id, final_response)
+            
+        except Exception as e:
+            logger.error(f"Ошибка создания игры из документа: {e}")
+            self.send_message(chat_id, f"❌ Ошибка создания игры: {e}\n\nПопробуйте создать игру вручную командой /new")
+    
     def ask_character_info(self, chat_id: int, user_id: int, character_number: int):
         """Запрос информации о персонаже"""
         session = self.get_user_session(user_id)
@@ -818,8 +1050,7 @@ class SimpleTelegramBot:
             if checkpoint_pdf:
                 checkpoint_uri = self.upload_file_to_google(
                     checkpoint_pdf, 
-                    f"checkpoint_{game_id}.pdf", 
-                    "application/pdf"
+                    f"checkpoint_{game_id}.pdf"
                 )
                 game.checkpoint_file_uri = checkpoint_uri
             
@@ -973,8 +1204,7 @@ class SimpleTelegramBot:
                 if chat_log_pdf:
                     log_uri = self.upload_file_to_google(
                         chat_log_pdf,
-                        f"chat_log_{game_id}_{int(time.time())}.pdf",
-                        "application/pdf"
+                        f"chat_log_{game_id}_{int(time.time())}.pdf"
                     )
                     game.chat_log_file_uri = log_uri
                 
@@ -983,8 +1213,7 @@ class SimpleTelegramBot:
                 if checkpoint_pdf:
                     checkpoint_uri = self.upload_file_to_google(
                         checkpoint_pdf,
-                        f"checkpoint_{game_id}_{int(time.time())}.pdf",
-                        "application/pdf"
+                        f"checkpoint_{game_id}_{int(time.time())}.pdf"
                     )
                     game.checkpoint_file_uri = checkpoint_uri
             
@@ -1022,13 +1251,37 @@ class SimpleTelegramBot:
             if not game:
                 self.send_message(chat_id, "❌ Игра не найдена")
                 return
-            
+                
             # Очищаем текущую сессию
             session = self.get_user_session(user_id)
             session['chat_history'] = []
             
-            # Формируем приветственное сообщение
+            # Формируем приветственное сообщение с последними событиями
             characters = ', '.join([char.name for char in game.characters])
+            
+            # Получаем информацию о последних событиях из памяти
+            last_events_info = ""
+            if game.chat_log_file_uri or game.checkpoint_file_uri:
+                last_events_prompt = f"""
+Проанализируй память игры "{game.title}" и кратко расскажи о последних событиях (2-3 предложения). 
+Что происходило в последний раз? Где находятся персонажи? Какая текущая ситуация?
+
+Формат ответа: просто краткое описание ситуации без лишнего форматирования.
+                """
+                
+                try:
+                    file_uris = []
+                    if game.chat_log_file_uri:
+                        file_uris.append(game.chat_log_file_uri)
+                    if game.checkpoint_file_uri:
+                        file_uris.append(game.checkpoint_file_uri)
+                    
+                    if file_uris:
+                        last_events = self.generate_with_files(last_events_prompt, file_uris)
+                        last_events_info = f"\n\n📖 **Последние события:**\n{last_events}"
+                        time.sleep(2)  # Задержка для API
+        except Exception as e:
+                    logger.error(f"Ошибка получения последних событий: {e}")
             
             message = f"""
 🎮 **Игра "{game.title}" загружена!**
@@ -1037,9 +1290,11 @@ class SimpleTelegramBot:
 🏷️ **Теги:** {', '.join(game.tags)}
 📅 **Последнее обновление:** {game.last_updated.strftime('%d.%m.%Y %H:%M')}
 
-📝 **Описание:** {game.description}
+📝 **Описание:** {game.description}{last_events_info}
 
-Игра восстановлена из памяти! Продолжайте свое приключение.
+💾 **Память восстановлена** - вся история и состояние персонажей доступны!
+
+Продолжайте свое приключение! 🎲
             """
             
             self.send_message(chat_id, message)
@@ -1084,7 +1339,7 @@ class SimpleTelegramBot:
         
         if active_game.chat_log_file_uri:
             message += "✅ Полный чат-лог сохранен\n"
-        else:
+            else:
             message += "❌ Чат-лог не создан\n"
             
         if active_game.checkpoint_file_uri:
@@ -1105,7 +1360,12 @@ class SimpleTelegramBot:
         self.answer_callback_query(callback_id)
         
         if callback_data == "new_game":
-            self.handle_new_command(chat_id, user_id)
+            # Проверяем, есть ли загруженный документ для автоматического создания игры
+            session = self.get_user_session(user_id)
+            if session.get('uploaded_document_uri') and session.get('uploaded_document_name'):
+                self.create_game_from_document(chat_id, user_id, session['uploaded_document_uri'], session['uploaded_document_name'])
+            else:
+                self.handle_new_command(chat_id, user_id)
         elif callback_data == "help":
             self.handle_help_command(chat_id)
         elif callback_data == "my_games":
@@ -1172,8 +1432,8 @@ class SimpleTelegramBot:
                 self.send_message(chat_id, "❌ Не удалось скачать файл")
                 return
             
-            # Загружаем файл в Google Files API
-            file_uri = self.upload_file_to_google(file_content, file_name, "application/pdf")
+            # Загружаем файл в Google Files API (MIME-тип определится автоматически)
+            file_uri = self.upload_file_to_google(file_content, file_name)
             
             if not file_uri:
                 self.send_message(chat_id, "❌ Не удалось загрузить файл в память")
@@ -1184,7 +1444,7 @@ class SimpleTelegramBot:
             
             if not active_game:
                 # Если нет активной игры, начинаем создание новой
-                session = self.get_user_session(user_id)
+            session = self.get_user_session(user_id)
                 session['uploaded_document_uri'] = file_uri
                 session['uploaded_document_name'] = file_name
                 
@@ -1319,12 +1579,16 @@ class SimpleTelegramBot:
             if active_game.checkpoint_file_uri:
                 file_uris.append(active_game.checkpoint_file_uri)
             
+            # Добавляем информацию о последних постах из памяти
+            if active_game.chat_log_file_uri or active_game.checkpoint_file_uri:
+                context_text += "\n💾 ПАМЯТЬ ИГРЫ: В памяти есть сохраненная история и состояние персонажей. Используй эту информацию для продолжения игры.\n"
+            
             # Отправляем запрос с подключенными файлами памяти
             if file_uris:
                 assistant_message = self.generate_with_files(context_text, file_uris)
             else:
-                response = self.model.generate_content(context_text)
-                assistant_message = response.text.strip()
+            response = self.model.generate_content(context_text)
+            assistant_message = response.text.strip()
             
             # Добавляем задержку для экономии квоты
             time.sleep(3)
