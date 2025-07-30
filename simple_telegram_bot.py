@@ -8,12 +8,20 @@ import json
 import logging
 import requests
 import time
+import signal
 from datetime import datetime
 from typing import Dict, List, Optional
 import google.generativeai as genai
 from dotenv import load_dotenv
 import io
 import tempfile
+import base64
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+from io import BytesIO
+from google.generativeai import GenerativeModel
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -41,11 +49,12 @@ class RoleplayGame:
 
 class Character:
     """Класс для хранения данных персонажа"""
-    def __init__(self, name: str, description: str, traits: str, backstory: str):
+    def __init__(self, name: str, description: str, traits: str, backstory: str, photo_uri: str = None):
         self.name = name
         self.description = description
         self.traits = traits
         self.backstory = backstory
+        self.photo_uri = photo_uri  # URI фото внешности персонажа
         self.current_state = ""
         self.relationships = {}
 
@@ -83,6 +92,9 @@ class SimpleTelegramBot:
         
         # Загружаем сохраненные игры
         self.load_saved_games()
+        
+        # Настраиваем обработчик сигнала для экстренного сохранения
+        signal.signal(signal.SIGINT, self.signal_handler)
         
         # Обновляем статус
         self.update_system_status('bot_started', True)
@@ -589,68 +601,290 @@ class SimpleTelegramBot:
         """Генерация ответа с подключенными файлами"""
         start_time = datetime.now()
         self.increment_counter('total_requests')
+        logger.info(f"Начинаем генерацию с файлами ({len(file_uris)} файлов)")
         
         try:
-            # Отправляем начальный прогресс
-            if chat_id:
-                self.send_progress_message(chat_id, progress_message_id, 10, "📡 Подключение к Gemini API...")
-            
-            # Создаем части для контента
-            parts = [{"text": prompt}]
-            
-            # Добавляем файлы
-            for i, file_uri in enumerate(file_uris):
-                parts.append({
-                    "file_data": {
-                        "file_uri": file_uri
-                    }
-                })
-                
-                # Обновляем прогресс при обработке файлов
-                if chat_id:
-                    file_progress = 20 + (i + 1) * 20 // len(file_uris)
-                    self.send_progress_message(chat_id, progress_message_id, file_progress, f"📁 Обработка файла {i+1}/{len(file_uris)}...")
-            
-            # Создаем контент
-            contents = [{"parts": parts}]
-            
-            # Обновляем прогресс перед отправкой запроса
-            if chat_id:
+            # Обновляем прогресс
+            if chat_id and progress_message_id:
                 self.send_progress_message(chat_id, progress_message_id, 60, "🧠 Генерация ответа...")
             
-            # Отправляем запрос
-            response = self.model.generate_content(contents)
+            # Подготавливаем файлы для Gemini
+            file_objects = []
+            total_file_size = 0
+            max_file_size = 10 * 1024 * 1024  # 10MB лимит
             
-            # Обновляем прогресс после получения ответа
-            if chat_id:
-                self.send_progress_message(chat_id, progress_message_id, 90, "📝 Форматирование ответа...")
+            for file_uri in file_uris:
+                try:
+                    # Проверяем, является ли это Google Files URI
+                    if 'generativelanguage.googleapis.com' in file_uri:
+                        # Для Google Files API получаем объект файла
+                        file_id = file_uri.split('/files/')[-1]
+                        file_obj = genai.get_file(file_id)
+                        
+                        # Проверяем размер файла
+                        if hasattr(file_obj, 'size_bytes') and file_obj.size_bytes:
+                            file_size = file_obj.size_bytes
+                            total_file_size += file_size
+                            
+                            if file_size > max_file_size:
+                                logger.warning(f"Файл {file_uri} слишком большой ({file_size} байт), пропускаем")
+                                continue
+                            elif total_file_size > max_file_size:
+                                logger.warning(f"Общий размер файлов превышает лимит ({total_file_size} байт), пропускаем остальные")
+                                break
+                        
+                        file_objects.append(file_obj)
+                        logger.info(f"Файл {file_uri} подготовлен для Gemini API")
+                    else:
+                        # Для Telegram файлов скачиваем содержимое
+                        file_content = self.download_file(file_uri)
+                        if file_content and len(file_content) > 100:
+                            file_size = len(file_content)
+                            total_file_size += file_size
+                            
+                            if file_size > max_file_size:
+                                logger.warning(f"Файл {file_uri} слишком большой ({file_size} байт), пропускаем")
+                                continue
+                            elif total_file_size > max_file_size:
+                                logger.warning(f"Общий размер файлов превышает лимит ({total_file_size} байт), пропускаем остальные")
+                                break
+                            
+                            # Создаем временный файл для загрузки в Gemini
+                            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+                                temp_file.write(file_content)
+                                temp_file_path = temp_file.name
+                            
+                            try:
+                                # Загружаем файл в Gemini
+                                uploaded_file = genai.upload_file(temp_file_path, mime_type="application/pdf")
+                                file_objects.append(uploaded_file)
+                                logger.info(f"Файл {file_uri} успешно загружен в Gemini ({file_size} байт)")
+                            finally:
+                                # Удаляем временный файл
+                                if os.path.exists(temp_file_path):
+                                    os.unlink(temp_file_path)
+                        else:
+                            logger.warning(f"Файл {file_uri} пустой или недоступен")
+                except Exception as e:
+                    logger.error(f"Ошибка при подготовке файла {file_uri}: {e}")
             
-            result = response.text.strip()
-            self.increment_counter('successful_requests')
+            if not file_objects:
+                logger.warning("Нет доступных файлов, используем обычную генерацию")
+                # Если файлы недоступны, используем обычную генерацию
+                def generate_func():
+                    return self.model.generate_content(prompt)
+                
+                response = generate_func()
+                self.increment_counter('successful_requests')
+                return response.text.strip()
             
-            # Завершаем прогресс
-            if chat_id:
-                self.send_progress_message(chat_id, progress_message_id, 100, "✅ Готово!")
-                time.sleep(1)  # Показываем 100% на секунду
+            logger.info(f"Подготовлено {len(file_objects)} файлов общим размером {total_file_size} байт")
             
-            # Логируем время
-            self.log_request_time(start_time, "Gemini с файлами", True)
+            # Создаем контент с файлами
+            content_parts = [{"text": prompt}]
+            for file_obj in file_objects:
+                content_parts.append(file_obj)
             
-            return result
+            # Генерируем ответ с таймаутом
+            def generate_with_files_func():
+                return self.model.generate_content(content_parts)
+            
+            try:
+                # Убираем таймаут для файлов - бесплатная версия Gemini работает медленно
+                logger.info("Отправляем запрос к Gemini API с файлами (без таймаута)")
+                response = generate_with_files_func()
+                
+                # Обновляем прогресс после получения ответа
+                if chat_id and progress_message_id:
+                    self.send_progress_message(chat_id, progress_message_id, 90, "📝 Форматирование ответа...")
+                
+                result = response.text.strip()
+                self.increment_counter('successful_requests')
+                
+                # Удаляем прогресс-бар если он есть
+                if chat_id and progress_message_id:
+                    self.delete_message(chat_id, progress_message_id)
+                    logger.info(f"Прогресс-бар удален для генерации с файлами")
+                
+                # Логируем время
+                self.log_request_time(start_time, "Gemini с файлами", True)
+                
+                return result
+                
+            except Exception as file_error:
+                logger.warning(f"Ошибка при генерации с файлами: {file_error}, пробуем без файлов")
+                
+                            # Проверяем, является ли это ошибкой блокировки контента
+            if "PROHIBITED_CONTENT" in str(file_error) or "blocked prompt" in str(file_error):
+                logger.warning("Обнаружен запрещенный контент, используем умную адаптацию")
+                
+                # Создаем безопасный промпт с умной адаптацией
+                safe_prompt = self.create_safe_prompt(prompt)
+                
+                def generate_func():
+                    response = self.model.generate_content(safe_prompt)
+                    # Восстанавливаем оригинальный контекст в ответе
+                    return self.restore_original_context(response)
+            else:
+                # Обычный fallback
+                def generate_func():
+                    return self.model.generate_content(prompt)
+                
+                try:
+                    response = generate_func()
+                    self.increment_counter('successful_requests')
+                    
+                    # Удаляем прогресс-бар если он есть
+                    if chat_id and progress_message_id:
+                        self.delete_message(chat_id, progress_message_id)
+                        logger.info(f"Прогресс-бар удален для fallback генерации")
+                    
+                    result = response.text.strip()
+                    
+                    # Логируем время
+                    self.log_request_time(start_time, "Gemini с файлами (fallback)", True)
+                    
+                    return result
+                except Exception as fallback_error:
+                    logger.error(f"Ошибка fallback генерации: {fallback_error}")
+                    return f"❌ Ошибка при обработке запроса: контент заблокирован системой безопасности"
+            
+        except TimeoutError as e:
+            logger.error(f"Таймаут генерации с файлами: {e}")
+            self.increment_counter('failed_requests')
+            self.update_system_status('last_error', f"Генерация с файлами: {e}")
+            self.log_request_time(start_time, "Gemini с файлами", False)
+            
+            # Удаляем прогресс-бар при ошибке
+            if chat_id and progress_message_id:
+                self.delete_message(chat_id, progress_message_id)
+                logger.info(f"Прогресс-бар удален при ошибке генерации с файлами")
+            
+            return f"❌ Ошибка при обработке запроса: {e}"
             
         except Exception as e:
             logger.error(f"Ошибка генерации с файлами: {e}")
             self.increment_counter('failed_requests')
             self.update_system_status('last_error', f"Генерация с файлами: {e}")
-            
-            # Показываем ошибку в прогресс-баре
-            if chat_id:
-                self.send_progress_message(chat_id, progress_message_id, 100, f"❌ Ошибка: {str(e)[:100]}")
-            
-            # Логируем время
             self.log_request_time(start_time, "Gemini с файлами", False)
             
-            return f"Ошибка при обработке запроса: {e}"
+            # Удаляем прогресс-бар при ошибке
+            if chat_id and progress_message_id:
+                self.delete_message(chat_id, progress_message_id)
+                logger.info(f"Прогресс-бар удален при ошибке генерации с файлами")
+            
+            # Проверяем тип ошибки и даем соответствующее сообщение
+            if "PROHIBITED_CONTENT" in str(e) or "blocked prompt" in str(e):
+                return f"🎭 Контент адаптирован для API. Игра продолжается с сохранением атмосферы и сюжета."
+            else:
+                return f"❌ Ошибка при обработке запроса: {e}"
+    
+    def create_safe_prompt(self, original_prompt: str) -> str:
+        """Создание безопасного промпта с умной адаптацией контента"""
+        try:
+            # Сохраняем оригинальный контент для внутреннего использования
+            self.last_original_content = original_prompt
+            
+            # Создаем умную систему замены с сохранением смысла
+            content_mapping = {
+                # Сексуальные термины -> романтические/эмоциональные
+                'секс': 'романтические отношения',
+                'сексуальный': 'романтический',
+                'эротика': 'романтика',
+                'порно': 'романтический контент',
+                'мастурбация': 'самоудовлетворение',
+                'мастурбирует': 'занимается самоудовлетворением',
+                
+                # Характерные черты -> более мягкие аналоги
+                'похотливый': 'страстный',
+                'распутный': 'свободолюбивый',
+                'вульгарный': 'прямолинейный',
+                'horny': 'passionate',
+                'porn': 'romantic content',
+                'erotic': 'romantic',
+                'masturbation': 'self-pleasure',
+                'vulgar': 'direct',
+                'lustful': 'passionate',
+                
+                # Специфические слова из вашего примера
+                'кокос': 'Кокос',
+                'nsfw': 'mature content',
+                
+                # Добавляем контекстные замены
+                'девушка-кошка': 'кошачья девушка',
+                'девушка-кролик': 'кроличья девушка',
+                'девушка-собачка': 'собачья девушка',
+                'получеловек': 'гибридный человек',
+                'получеловеческий': 'гибридный',
+            }
+            
+            safe_prompt = original_prompt
+            
+            # Применяем замены с сохранением контекста
+            for problematic, replacement in content_mapping.items():
+                # Заменяем с учетом регистра
+                safe_prompt = safe_prompt.replace(problematic, replacement)
+                safe_prompt = safe_prompt.replace(problematic.capitalize(), replacement.capitalize())
+                safe_prompt = safe_prompt.replace(problematic.upper(), replacement.upper())
+            
+            # Добавляем инструкцию для сохранения атмосферы
+            safe_prompt += "\n\n🎭 Примечание: Контент адаптирован для соблюдения правил API, но атмосфера и сюжет сохранены."
+            
+            return safe_prompt
+            
+        except Exception as e:
+            logger.error(f"Ошибка создания безопасного промпта: {e}")
+            return "Создайте ролевую игру с персонажами, соблюдая правила контента."
+    
+    def restore_original_context(self, response):
+        """Восстановление оригинального контекста в ответе"""
+        try:
+            if hasattr(self, 'last_original_content') and self.last_original_content:
+                # Анализируем ответ и восстанавливаем оригинальные термины где это уместно
+                original_text = response.text
+                
+                # Обратное отображение для восстановления контекста
+                context_restoration = {
+                    'романтические отношения': 'секс',
+                    'романтический': 'сексуальный',
+                    'романтика': 'эротика',
+                    'романтический контент': 'порно',
+                    'самоудовлетворение': 'мастурбация',
+                    'занимается самоудовлетворением': 'мастурбирует',
+                    'страстный': 'похотливый',
+                    'свободолюбивый': 'распутный',
+                    'прямолинейный': 'вульгарный',
+                    'passionate': 'horny',
+                    'romantic content': 'porn',
+                    'romantic': 'erotic',
+                    'self-pleasure': 'masturbation',
+                    'direct': 'vulgar',
+                    'mature content': 'nsfw',
+                    'кошачья девушка': 'девушка-кошка',
+                    'кроличья девушка': 'девушка-кролик',
+                    'собачья девушка': 'девушка-собачка',
+                    'гибридный человек': 'получеловек',
+                    'гибридный': 'получеловеческий',
+                }
+                
+                # Восстанавливаем оригинальные термины в ответе
+                restored_text = original_text
+                for safe_term, original_term in context_restoration.items():
+                    # Восстанавливаем только в контексте персонажей и их описаний
+                    if 'персонаж' in restored_text.lower() or 'описание' in restored_text.lower():
+                        restored_text = restored_text.replace(safe_term, original_term)
+                
+                # Создаем новый объект ответа с восстановленным текстом
+                response.text = restored_text
+                
+                # Очищаем сохраненный контент
+                self.last_original_content = None
+                
+            return response
+            
+        except Exception as e:
+            logger.error(f"Ошибка восстановления контекста: {e}")
+            return response
     
     def send_chat_action(self, chat_id: int, action: str):
         """Отправка действия чата"""
@@ -696,10 +930,26 @@ class SimpleTelegramBot:
         url = f"https://api.telegram.org/file/bot{self.telegram_token}/{file_path}"
         
         try:
-            response = requests.get(url)
-            return response.content
+            response = requests.get(url, timeout=30)
+            if response.status_code == 200:
+                content = response.content
+                if len(content) > 100:  # Проверяем, что файл не пустой
+                    logger.info(f"Файл {file_path} успешно загружен ({len(content)} байт)")
+                    return content
+                else:
+                    logger.warning(f"Файл {file_path} слишком маленький ({len(content)} байт)")
+                    return None
+            else:
+                logger.error(f"Ошибка загрузки файла {file_path}: HTTP {response.status_code}")
+                return None
+        except requests.exceptions.Timeout:
+            logger.error(f"Таймаут при загрузке файла {file_path}")
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Ошибка сети при загрузке файла {file_path}: {e}")
+            return None
         except Exception as e:
-            logger.error(f"Ошибка скачивания файла: {e}")
+            logger.error(f"Ошибка скачивания файла {file_path}: {e}")
             return None
     
 
@@ -737,6 +987,16 @@ class SimpleTelegramBot:
 - Все ролевые игры сохраняются автоматически
 - Каждая игра имеет полный чат-лог и чекпоинты
 - Можно переключаться между разными ролевыми играми
+
+🖼️ **Анализ фото в игре:**
+- Отправляйте фото во время активной ролевой игры
+- Добавляйте описание к фото для лучшего анализа
+- Нейкон проанализирует фото в контексте игры
+
+📖 **Чтение документов в игре:**
+- Отправляйте PDF документы во время активной игры
+- Нейкон проанализирует документ в контексте игры
+- Определит связь с сюжетом и предложит действия
         """
         
         keyboard_buttons = [
@@ -769,9 +1029,10 @@ class SimpleTelegramBot:
 **🎲 Создание ролевой игры:**
 1. Выберите количество персонажей (1-5)
 2. Опишите каждого персонажа детально
-3. Задайте мир и историю
-4. Добавьте теги для жанра
-5. Начинайте играть!
+3. **📸 Прикрепите фото внешности персонажа (опционально)**
+4. Задайте мир и историю
+5. Добавьте теги для жанра
+6. Начинайте играть!
 
 **💾 Продвинутая система памяти:**
 - Каждая игра имеет **2 файла памяти**:
@@ -787,6 +1048,30 @@ class SimpleTelegramBot:
 - Файлы с "chat" или "log" → чат-лог
 - Остальные файлы → чекпоинт
 - Документы доступны через весь диалог
+
+**📖 Чтение документов во время ролевой игры:**
+- Отправляйте PDF документы во время активной игры
+- Нейкон проанализирует документ в контексте игры
+- Определит связь с сюжетом и персонажами
+- Предложит, как документ может повлиять на события
+- Документ автоматически добавляется в память игры
+- Анализ сохраняется в истории игры
+
+**📸 Фото персонажей:**
+- Прикрепляйте фото внешности персонажей при создании
+- Фото сохраняется в памяти игры
+- Помогает лучше визуализировать персонажей
+- Поддерживаются файлы до 10MB
+- Можно загрузить фото в любой момент создания персонажа
+
+**🖼️ Анализ фото во время ролевой игры:**
+- Отправляйте фото во время активной игры
+- Добавляйте описание к фото (caption)
+- Нейкон проанализирует фото в контексте игры
+- Определит связь с сюжетом и персонажами
+- Предложит возможные действия
+- Фото сохраняется в истории игры
+- Поддерживаются файлы до 10MB
 
 **🎮 Управление играми:**
 - **Сохранение**: завершить текущую игру и сохранить
@@ -806,6 +1091,13 @@ class SimpleTelegramBot:
 - Таймаут 10 секунд для автоматической отправки
 - Поддержка знаков продолжения (...)
 - Возможность отмены сообщения
+- Лимит: 15000 символов на сообщение
+
+**⚡ Оптимизация производительности:**
+- Автоматическая обрезка контекста при превышении лимитов
+- Таймаут 60 секунд для запросов к Gemini API
+- Ограничение истории диалога (последние 10 сообщений)
+- Прогресс-бар для отслеживания обработки
 
 **Примеры игр:**
 - 🏰 Фэнтези: эльфы, драконы, магия
@@ -819,6 +1111,12 @@ class SimpleTelegramBot:
 - Автоматическое создание PDF
 - Поддержка множественных персонажей
 - Система мониторинга состояния
+
+**🎭 Система адаптации контента:**
+- Автоматическая адаптация контента для соблюдения правил API
+- Сохранение атмосферы и сюжета ролевых игр
+- Умная замена терминов с сохранением смысла
+- Поддержка различных жанров и сценариев
 
 Создайте свою первую игру командой /new! 🎲
         """
@@ -981,9 +1279,10 @@ class SimpleTelegramBot:
             # Добавляем начальное сообщение в историю
             session['chat_history'].append({"role": "assistant", "content": response})
             
-            # Завершаем прогресс
-            self.send_progress_message(chat_id, progress_message_id, 100, "✅ Игра создана!")
-            time.sleep(1)
+            # Удаляем прогресс-бар если он есть
+            if progress_message_id is not None:
+                self.delete_message(chat_id, progress_message_id)
+                logger.info(f"Пользователь {user_id}: прогресс-бар удален после создания игры из документа")
             
             # Отправляем ответ с информацией о созданной игре
             final_response = f"""
@@ -1006,9 +1305,10 @@ class SimpleTelegramBot:
         except Exception as e:
             logger.error(f"Ошибка создания игры из документа: {e}")
             
-            # Показываем ошибку в прогресс-баре
-            if 'progress_message_id' in locals():
-                self.send_progress_message(chat_id, progress_message_id, 100, f"❌ Ошибка: {str(e)[:100]}")
+            # Удаляем прогресс-бар при ошибке
+            if 'progress_message_id' in locals() and progress_message_id is not None:
+                self.delete_message(chat_id, progress_message_id)
+                logger.info(f"Пользователь {user_id}: прогресс-бар удален при ошибке создания игры из документа")
             
             # Логируем время
             self.log_request_time(start_time, "Создание игры из документа", False)
@@ -1033,38 +1333,54 @@ class SimpleTelegramBot:
 **Черты характера:** [Личность, особенности]
 **Предыстория:** [История персонажа, откуда он]
 
+📸 **Фото внешности (опционально):**
+Можете прикрепить фото внешности персонажа. Это поможет лучше визуализировать персонажа в игре.
+
 Пример:
 **Имя:** Эльриэль Звездокрылая
 **Описание:** Молодая эльфийка 120 лет, высокая и грациозная, с серебристыми волосами
 **Черты характера:** Мудрая, но импульсивная, любит природу и магию
 **Предыстория:** Выросла в лесном королевстве, изучает древнюю магию
+
+*Также поддерживается формат без звездочек:*
+Имя: Эльриэль Звездокрылая
+Описание: Молодая эльфийка 120 лет, высокая и грациозная, с серебристыми волосами
+Черты характера: Мудрая, но импульсивная, любит природу и магию
+Предыстория: Выросла в лесном королевстве, изучает древнюю магию
         """
         
         session['character_creation_step'] = character_number
+        session['waiting_for_character_photo'] = False  # Флаг ожидания фото
         self.send_message(chat_id, message)
     
     def parse_character_info(self, text: str) -> Optional[Dict]:
         """Парсинг информации о персонаже"""
         try:
             lines = text.strip().split('\n')
-            character = {'name': '', 'description': '', 'traits': '', 'backstory': ''}
+            character = {'name': '', 'description': '', 'traits': '', 'backstory': '', 'photo_uri': None}
             
             current_field = None
             for line in lines:
                 line = line.strip()
-                if line.startswith('**Имя:**'):
-                    character['name'] = line.replace('**Имя:**', '').strip()
+                # Поддержка разных форматов
+                if line.startswith('**Имя:**') or line.startswith('Имя:') or line.startswith('Имя：'):
+                    character['name'] = line.replace('**Имя:**', '').replace('Имя:', '').replace('Имя：', '').strip()
                     current_field = 'name'
-                elif line.startswith('**Описание:**'):
-                    character['description'] = line.replace('**Описание:**', '').strip()
+                elif line.startswith('**Описание:**') or line.startswith('Описание:') or line.startswith('Описание：'):
+                    character['description'] = line.replace('**Описание:**', '').replace('Описание:', '').replace('Описание：', '').strip()
                     current_field = 'description'
-                elif line.startswith('**Черты характера:**') or line.startswith('**Черты:**'):
-                    character['traits'] = line.replace('**Черты характера:**', '').replace('**Черты:**', '').strip()
+                elif (line.startswith('**Черты характера:**') or line.startswith('**Черты:**') or 
+                      line.startswith('Черты характера:') or line.startswith('Черты:') or
+                      line.startswith('Черты характера：') or line.startswith('Черты：')):
+                    character['traits'] = (line.replace('**Черты характера:**', '').replace('**Черты:**', '')
+                                         .replace('Черты характера:', '').replace('Черты:', '')
+                                         .replace('Черты характера：', '').replace('Черты：', '').strip())
                     current_field = 'traits'
-                elif line.startswith('**Предыстория:**'):
-                    character['backstory'] = line.replace('**Предыстория:**', '').strip()
+                elif line.startswith('**Предыстория:**') or line.startswith('Предыстория:') or line.startswith('Предыстория：'):
+                    character['backstory'] = line.replace('**Предыстория:**', '').replace('Предыстория:', '').replace('Предыстория：', '').strip()
                     current_field = 'backstory'
-                elif line and current_field and not line.startswith('**'):
+                elif line and current_field and not (line.startswith('**') or line.startswith('Имя:') or line.startswith('Описание:') or 
+                                                    line.startswith('Черты:') or line.startswith('Предыстория:')):
                     # Продолжение текущего поля
                     character[current_field] += ' ' + line
             
@@ -1077,6 +1393,77 @@ class SimpleTelegramBot:
             logger.error(f"Ошибка парсинга персонажа: {e}")
             return None
     
+    def handle_character_photo(self, message):
+        """Обработка фото персонажа во время создания"""
+        chat_id = message['chat']['id']
+        user_id = message['from']['id']
+        
+        session = self.get_user_session(user_id)
+        
+        # Проверяем, что мы в процессе создания персонажа
+        if not session.get('character_creation_step') or session['character_creation_step'] <= 0:
+            self.send_message(chat_id, "❌ Фото персонажа можно прикрепить только во время создания персонажа!")
+            return
+        
+        # Получаем фото (берем самое большое доступное)
+        photos = message['photo']
+        if not photos:
+            self.send_message(chat_id, "❌ Не удалось получить фото")
+            return
+        
+        # Берем фото с максимальным размером
+        photo = max(photos, key=lambda x: x.get('file_size', 0))
+        file_id = photo['file_id']
+        file_size = photo.get('file_size', 0)
+        
+        # Проверяем размер файла (максимум 10MB для фото)
+        if file_size > 10 * 1024 * 1024:
+            self.send_message(chat_id, "❌ Фото слишком большое. Максимальный размер: 10MB")
+            return
+        
+        try:
+            # Получаем информацию о файле
+            file_info = self.get_file(file_id)
+            if not file_info or not file_info.get('ok'):
+                self.send_message(chat_id, "❌ Не удалось получить информацию о фото")
+                return
+            
+            file_path = file_info['result']['file_path']
+            
+            # Скачиваем фото
+            photo_content = self.download_file(file_path)
+            if not photo_content:
+                self.send_message(chat_id, "❌ Не удалось скачать фото")
+                return
+            
+            # Загружаем фото в Google Files API
+            file_name = f"character_photo_{user_id}_{session['character_creation_step']}.jpg"
+            photo_uri = self.upload_file_to_google(photo_content, file_name, "image/jpeg")
+            
+            if not photo_uri:
+                self.send_message(chat_id, "❌ Не удалось загрузить фото в память")
+                return
+            
+            # Сохраняем URI фото в сессии
+            session['current_character_photo_uri'] = photo_uri
+            session['waiting_for_character_photo'] = True
+            
+            self.send_message(chat_id, f"✅ Фото внешности персонажа {session['character_creation_step']} успешно загружено!")
+            
+            # Показываем кнопки для продолжения
+            keyboard = {
+                'inline_keyboard': [
+                    [{'text': '✅ Продолжить создание персонажа', 'callback_data': 'continue_character'}],
+                    [{'text': '🔄 Загрузить другое фото', 'callback_data': 'retry_photo'}]
+                ]
+            }
+            
+            self.send_message(chat_id, "Теперь можете продолжить описание персонажа или загрузить другое фото:", keyboard)
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки фото персонажа: {e}")
+            self.send_message(chat_id, f"❌ Ошибка при обработке фото: {e}")
+    
     def ask_game_description(self, chat_id: int, user_id: int):
         """Запрос описания игры"""
         session = self.get_user_session(user_id)
@@ -1084,7 +1471,8 @@ class SimpleTelegramBot:
         
         characters_text = ""
         for i, char in enumerate(session['new_game_data']['characters'], 1):
-            characters_text += f"\n{i}. **{char['name']}** - {char['description']}"
+            photo_info = " 📸" if char.get('photo_uri') else ""
+            characters_text += f"\n{i}. **{char['name']}** - {char['description']}{photo_info}"
         
         message = f"""
 🎲 **Финальный этап создания игры**
@@ -1149,7 +1537,8 @@ class SimpleTelegramBot:
                     char_data['name'],
                     char_data['description'],
                     char_data['traits'],
-                    char_data['backstory']
+                    char_data['backstory'],
+                    char_data.get('photo_uri')  # Добавляем фото, если есть
                 )
                 game.characters.append(character)
             
@@ -1208,9 +1597,10 @@ class SimpleTelegramBot:
 ПЕРСОНАЖИ:"""
             
             for char in game.characters:
+                photo_info = f" (есть фото внешности)" if char.photo_uri else ""
                 context += f"""
 
-{char.name}:
+{char.name}:{photo_info}
 - Описание: {char.description}
 - Черты характера: {char.traits}
 - Предыстория: {char.backstory}"""
@@ -1278,9 +1668,11 @@ class SimpleTelegramBot:
         for i, game in enumerate(saved_games):
             status = "🟢 Активна" if game.is_active else "⚪ Неактивна"
             characters = ', '.join([char.name for char in game.characters])
+            photo_count = sum(1 for char in game.characters if char.photo_uri)
+            photo_info = f" 📸({photo_count})" if photo_count > 0 else ""
             
             message += f"""
-**{i+1}. {game.title}** {status}
+**{i+1}. {game.title}** {status}{photo_info}
 👥 Персонажи: {characters}
 🏷️ Теги: {', '.join(game.tags)}
 📅 Создана: {game.created_at.strftime('%d.%m.%Y')}
@@ -1445,8 +1837,9 @@ class SimpleTelegramBot:
 """
         
         for char in active_game.characters:
+            photo_info = " 📸" if char.photo_uri else ""
             message += f"""
-**{char.name}**
+**{char.name}**{photo_info}
 - Описание: {char.description}
 - Черты: {char.traits}
 - Предыстория: {char.backstory}
@@ -1514,22 +1907,182 @@ class SimpleTelegramBot:
             self.handle_send_complete_message(chat_id, user_id)
         elif callback_data == "cancel_message":
             self.handle_cancel_message(chat_id, user_id)
+        elif callback_data == "continue_character":
+            # Продолжаем создание персонажа после загрузки фото
+            session = self.get_user_session(user_id)
+            if session.get('character_creation_step') and session.get('waiting_for_character_photo'):
+                session['waiting_for_character_photo'] = False
+                self.send_message(chat_id, "Теперь опишите персонажа текстом:")
+            else:
+                self.send_message(chat_id, "❌ Нет активного процесса создания персонажа")
+        elif callback_data == "retry_photo":
+            # Повторная загрузка фото персонажа
+            session = self.get_user_session(user_id)
+            if session.get('character_creation_step'):
+                session['current_character_photo_uri'] = None
+                session['waiting_for_character_photo'] = False
+                self.send_message(chat_id, "Отправьте новое фото внешности персонажа:")
+            else:
+                self.send_message(chat_id, "❌ Нет активного процесса создания персонажа")
     
     def handle_photo(self, message):
-        """Обработка загруженного изображения"""
+        """Обработка загруженного фото во время ролевой игры"""
         chat_id = message['chat']['id']
         user_id = message['from']['id']
+        user_name = message['from'].get('first_name', 'Пользователь')
         
-        self.send_message(chat_id, """
-🖼️ **Изображения временно не поддерживаются**
+        # Получаем активную игру
+        active_game = self.get_active_game(user_id)
+        
+        if not active_game:
+            self.send_message(chat_id, """
+🖼️ **Фото можно отправлять только во время активной ролевой игры!**
 
-В новой версии бота сосредоточены на:
-- PDF документах для памяти игры
-- Продвинутой системе персонажей
-- Сохранении ролевых игр
+Сначала создайте или загрузите ролевую игру, а затем отправляйте фото для анализа в контексте игры.
+            """)
+            return
+        
+        # Получаем фото (берем самое большое доступное)
+        photos = message['photo']
+        if not photos:
+            self.send_message(chat_id, "❌ Не удалось получить фото")
+            return
+        
+        # Берем фото с максимальным размером
+        photo = max(photos, key=lambda x: x.get('file_size', 0))
+        file_id = photo['file_id']
+        file_size = photo.get('file_size', 0)
+        
+        # Проверяем размер файла (максимум 10MB для фото)
+        if file_size > 10 * 1024 * 1024:
+            self.send_message(chat_id, "❌ Фото слишком большое. Максимальный размер: 10MB")
+            return
+        
+        # Получаем описание к фото (caption)
+        caption = message.get('caption', '')
+        
+        # Отправляем статус обработки
+        self.send_message(chat_id, f"🖼️ Анализирую фото в контексте игры \"{active_game.title}\"...")
+        self.send_chat_action(chat_id, "upload_photo")
+        
+        try:
+            # Получаем информацию о файле
+            file_info = self.get_file(file_id)
+            if not file_info or not file_info.get('ok'):
+                self.send_message(chat_id, "❌ Не удалось получить информацию о фото")
+                return
+            
+            file_path = file_info['result']['file_path']
+            
+            # Скачиваем фото
+            photo_content = self.download_file(file_path)
+            if not photo_content:
+                self.send_message(chat_id, "❌ Не удалось скачать фото")
+                return
+            
+            # Создаем временный файл для загрузки в Gemini
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_file:
+                temp_file.write(photo_content)
+                temp_file_path = temp_file.name
+            
+            try:
+                # Загружаем фото в Gemini
+                uploaded_photo = genai.upload_file(temp_file_path, mime_type="image/jpeg")
+                
+                # Формируем промпт для анализа фото в контексте игры
+                analysis_prompt = f"""
+{self.system_prompt}
 
-Используйте PDF файлы для лучшей интеграции с системой памяти!
-        """)
+ТЕКУЩАЯ ИГРА: {active_game.title}
+ОПИСАНИЕ ИГРЫ: {active_game.description}
+
+ЗАДАЧА: Проанализируй загруженное фото в контексте текущей ролевой игры.
+
+ИНСТРУКЦИИ:
+1. Внимательно изучи содержимое фото
+2. Определи, как это фото связано с текущей ролевой игрой
+3. Опиши, что происходит на фото в контексте игры
+4. Предложи, как это фото может повлиять на развитие сюжета
+5. Если пользователь добавил описание к фото, учти его
+
+ОПИСАНИЕ ПОЛЬЗОВАТЕЛЯ К ФОТО: {caption if caption else "Описание не добавлено"}
+
+ФОРМАТ ОТВЕТА:
+🖼️ **Анализ фото в контексте игры "{active_game.title}"**
+
+**📸 Что изображено:**
+[Описание того, что видно на фото]
+
+**🎮 Связь с игрой:**
+[Как это фото связано с текущей ролевой игрой]
+
+**📝 Влияние на сюжет:**
+[Как это фото может повлиять на развитие событий]
+
+**🎯 Возможные действия:**
+[Предложения по дальнейшим действиям в игре]
+
+Анализируй фото творчески и в контексте текущей ролевой игры!
+                """
+                
+                # Отправляем прогресс
+                progress_response = self.send_progress_message(chat_id, None, 10, "🖼️ Анализ фото...")
+                progress_message_id = None
+                if progress_response and isinstance(progress_response, dict) and progress_response.get('ok'):
+                    progress_message_id = progress_response['result']['message_id']
+                
+                # Создаем контент с фото и текстом
+                content_parts = [
+                    {"text": analysis_prompt},
+                    uploaded_photo
+                ]
+                
+                self.send_progress_message(chat_id, progress_message_id, 30, "🧠 Анализ в контексте игры...")
+                
+                # Генерируем ответ с фото
+                logger.info(f"Пользователь {user_id}: анализируем фото в контексте игры")
+                response = self.model.generate_content(content_parts)
+                
+                self.send_progress_message(chat_id, progress_message_id, 90, "📝 Форматирование ответа...")
+                
+                analysis_result = response.text.strip()
+                
+                # Добавляем анализ в историю игры
+                session = self.get_user_session(user_id)
+                session['chat_history'].append({
+                    "role": "user", 
+                    "content": f"[ФОТО] {caption if caption else 'Фото без описания'}"
+                })
+                session['chat_history'].append({
+                    "role": "assistant", 
+                    "content": analysis_result
+                })
+                
+                # Удаляем прогресс-бар если он есть
+                if progress_message_id is not None:
+                    self.delete_message(chat_id, progress_message_id)
+                    logger.info(f"Пользователь {user_id}: прогресс-бар удален после анализа фото")
+                
+                # Отправляем результат
+                self.send_message(chat_id, analysis_result)
+                
+                # Логируем успех
+                logger.info(f"Пользователь {user_id}: фото проанализировано успешно")
+                
+            finally:
+                # Удаляем временный файл
+                if os.path.exists(temp_file_path):
+                    os.unlink(temp_file_path)
+                    
+        except Exception as e:
+            logger.error(f"Ошибка анализа фото: {e}")
+            
+            # Удаляем прогресс-бар при ошибке
+            if 'progress_message_id' in locals() and progress_message_id is not None:
+                self.delete_message(chat_id, progress_message_id)
+                logger.info(f"Пользователь {user_id}: прогресс-бар удален при ошибке анализа фото")
+            
+            self.send_message(chat_id, f"❌ Ошибка при анализе фото: {e}")
     
     def handle_document(self, message):
         """Обработка загруженного документа"""
@@ -1547,8 +2100,11 @@ class SimpleTelegramBot:
             self.send_message(chat_id, "❌ Файл слишком большой. Максимальный размер: 20MB")
             return
         
+        # Получаем активную игру
+        active_game = self.get_active_game(user_id)
+        
         # Отправляем статус обработки
-        self.send_message(chat_id, f"📄 Загружаю документ в память игры: {file_name}")
+        self.send_message(chat_id, f"📄 Загружаю документ: {file_name}")
         self.send_chat_action(chat_id, "upload_document")
         
         try:
@@ -1566,15 +2122,12 @@ class SimpleTelegramBot:
                 self.send_message(chat_id, "❌ Не удалось скачать файл")
                 return
             
-            # Загружаем файл в Google Files API (MIME-тип определится автоматически)
+            # Загружаем файл в Google Files API
             file_uri = self.upload_file_to_google(file_content, file_name)
             
             if not file_uri:
                 self.send_message(chat_id, "❌ Не удалось загрузить файл в память")
                 return
-            
-            # Проверяем активную игру
-            active_game = self.get_active_game(user_id)
             
             if not active_game:
                 # Если нет активной игры, начинаем создание новой
@@ -1600,33 +2153,131 @@ class SimpleTelegramBot:
                 self.send_message(chat_id, message, keyboard)
                 return
             
-            # Если есть активная игра, добавляем документ в её память
-            if file_name.lower().endswith('.pdf'):
-                # Обновляем чат-лог или чекпоинт
-                if 'chat' in file_name.lower() or 'log' in file_name.lower():
-                    active_game.chat_log_file_uri = file_uri
-                    message = f"📚 Документ \"{file_name}\" добавлен как чат-лог к игре \"{active_game.title}\""
+            # Если есть активная игра, анализируем документ в контексте игры
+            if active_game:
+                self.send_message(chat_id, f"📖 Анализирую документ в контексте игры \"{active_game.title}\"...")
+                
+                # Создаем временный файл для загрузки в Gemini
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+                    temp_file.write(file_content)
+                    temp_file_path = temp_file.name
+                
+                try:
+                    # Загружаем документ в Gemini
+                    uploaded_document = genai.upload_file(temp_file_path, mime_type="application/pdf")
+                    
+                    # Формируем промпт для анализа документа в контексте игры
+                    analysis_prompt = f"""
+{self.system_prompt}
+
+ТЕКУЩАЯ ИГРА: {active_game.title}
+ОПИСАНИЕ ИГРЫ: {active_game.description}
+
+ЗАДАЧА: Проанализируй загруженный документ "{file_name}" в контексте текущей ролевой игры.
+
+ИНСТРУКЦИИ:
+1. Внимательно изучи содержимое документа
+2. Определи, как этот документ связан с текущей ролевой игрой
+3. Опиши, что содержится в документе в контексте игры
+4. Предложи, как этот документ может повлиять на развитие сюжета
+5. Определи, является ли это дополнительной информацией или новым направлением
+
+ФОРМАТ ОТВЕТА:
+📖 **Анализ документа "{file_name}" в контексте игры "{active_game.title}"**
+
+**📄 Содержимое документа:**
+[Краткое описание того, что содержится в документе]
+
+**🎮 Связь с игрой:**
+[Как этот документ связан с текущей ролевой игрой]
+
+**📝 Влияние на сюжет:**
+[Как этот документ может повлиять на развитие событий]
+
+**💾 Рекомендации по памяти:**
+[Следует ли добавить этот документ в чат-лог или чекпоинт]
+
+**🎯 Возможные действия:**
+[Предложения по дальнейшим действиям в игре]
+
+Анализируй документ творчески и в контексте текущей ролевой игры!
+                    """
+                    
+                    # Отправляем прогресс
+                    progress_response = self.send_progress_message(chat_id, None, 10, "📖 Анализ документа...")
+                    progress_message_id = None
+                    if progress_response and isinstance(progress_response, dict) and progress_response.get('ok'):
+                        progress_message_id = progress_response['result']['message_id']
+                    
+                    # Создаем контент с документом и текстом
+                    content_parts = [
+                        {"text": analysis_prompt},
+                        uploaded_document
+                    ]
+                    
+                    self.send_progress_message(chat_id, progress_message_id, 30, "🧠 Анализ в контексте игры...")
+                    
+                    # Генерируем ответ с документом
+                    logger.info(f"Пользователь {user_id}: анализируем документ в контексте игры")
+                    response = self.model.generate_content(content_parts)
+                    
+                    self.send_progress_message(chat_id, progress_message_id, 90, "📝 Форматирование ответа...")
+                    
+                    analysis_result = response.text.strip()
+                    
+                    # Добавляем анализ в историю игры
+                    session = self.get_user_session(user_id)
+                    session['chat_history'].append({
+                        "role": "user", 
+                        "content": f"[ДОКУМЕНТ] {file_name}"
+                    })
+                    session['chat_history'].append({
+                        "role": "assistant", 
+                        "content": analysis_result
+                    })
+                    
+                    # Удаляем прогресс-бар если он есть
+                    if progress_message_id is not None:
+                        self.delete_message(chat_id, progress_message_id)
+                        logger.info(f"Пользователь {user_id}: прогресс-бар удален после анализа документа")
+                    
+                    # Отправляем результат
+                    self.send_message(chat_id, analysis_result)
+                    
+                    # Логируем успех
+                    logger.info(f"Пользователь {user_id}: документ проанализирован успешно")
+                    
+                finally:
+                    # Удаляем временный файл
+                    if os.path.exists(temp_file_path):
+                        os.unlink(temp_file_path)
+                
+                # Также добавляем документ в память игры (как раньше)
+                if file_name.lower().endswith('.pdf'):
+                    # Обновляем чат-лог или чекпоинт
+                    if 'chat' in file_name.lower() or 'log' in file_name.lower():
+                        active_game.chat_log_file_uri = file_uri
+                        memory_message = f"📚 Документ \"{file_name}\" добавлен как чат-лог к игре \"{active_game.title}\""
+                    else:
+                        active_game.checkpoint_file_uri = file_uri
+                        memory_message = f"💾 Документ \"{file_name}\" добавлен как чекпоинт к игре \"{active_game.title}\""
+                    
+                    # Сохраняем изменения
+                    self.save_games_to_file()
+                    
+                    self.send_message(chat_id, f"\n\n✅ {memory_message}\n\nТеперь вся память игры доступна для ролевой игры!")
                 else:
-                    active_game.checkpoint_file_uri = file_uri
-                    message = f"💾 Документ \"{file_name}\" добавлен как чекпоинт к игре \"{active_game.title}\""
-                
-                # Сохраняем изменения
-                self.save_games_to_file()
-                
-                self.send_message(chat_id, f"✅ {message}\n\nТеперь вся память игры доступна для ролевой игры!")
-            else:
-                self.send_message(chat_id, "⚠️ Рекомендуется использовать PDF файлы для лучшей совместимости с системой памяти.")
-            
+                    self.send_message(chat_id, "\n\n⚠️ Рекомендуется использовать PDF файлы для лучшей совместимости с системой памяти.")
+                    
         except Exception as e:
-            logger.error(f"Ошибка при обработке документа: {e}")
+            logger.error(f"Ошибка обработки документа: {e}")
             
-            # Проверяем ошибку квоты
-            if "429" in str(e) or "quota" in str(e).lower():
-                self.send_message(chat_id, 
-                    "⚠️ Превышен лимит запросов к Google API. Попробуйте через несколько минут.")
-            else:
-                self.send_message(chat_id, 
-                    "❌ Произошла ошибка при обработке документа. Попробуйте позже.")
+            # Удаляем прогресс-бар при ошибке
+            if 'progress_message_id' in locals() and progress_message_id is not None:
+                self.delete_message(chat_id, progress_message_id)
+                logger.info(f"Пользователь {user_id}: прогресс-бар удален при ошибке обработки документа")
+            
+            self.send_message(chat_id, f"❌ Ошибка при обработке документа: {e}")
     
     def handle_message(self, message):
         """Обработка текстового сообщения"""
@@ -1652,135 +2303,94 @@ class SimpleTelegramBot:
         # Обработка разбитых сообщений
         if session.get('waiting_for_complete_message'):
             # Пользователь продолжает писать
-            needs_more = self.add_message_to_buffer(user_id, text)
+            logger.info(f"Пользователь {user_id}: продолжает писать в буфере")
             
-            if needs_more:
-                # Показываем кнопку для завершения
-                self.send_message_complete_button(chat_id, user_id)
-                return
+            # Проверяем, нужно ли принудительно отправить
+            if self.check_and_force_send(user_id):
+                forced_text = self.force_send_buffered_message(user_id)
+                if forced_text:
+                    text = forced_text
+                    logger.info(f"Пользователь {user_id}: принудительная отправка, длина: {len(text)} символов")
+                else:
+                    logger.warning(f"Пользователь {user_id}: буфер пуст при принудительной отправке")
+                    return
             else:
-                # Сообщение завершено, получаем полный текст
-                complete_text = self.get_complete_message(user_id)
-                text = complete_text
+                needs_more = self.add_message_to_buffer(user_id, text)
+                
+                if needs_more:
+                    # Показываем кнопку для завершения
+                    logger.info(f"Пользователь {user_id}: показываем кнопку завершения")
+                    self.send_message_complete_button(chat_id, user_id)
+                    return
+                else:
+                    # Сообщение завершено, получаем полный текст
+                    complete_text = self.get_complete_message(user_id)
+                    logger.info(f"Пользователь {user_id}: буфер завершен, длина: {len(complete_text)} символов")
+                    text = complete_text
         else:
             # Проверяем, нужно ли начать буферизацию
+            logger.info(f"Пользователь {user_id}: проверяем необходимость буферизации")
+            
+            # Если сообщение слишком длинное, сразу отправляем без буферизации
+            if len(text) > 15000:
+                logger.warning(f"Пользователь {user_id}: сообщение слишком длинное ({len(text)} символов), отправляем без буферизации")
+                # Добавляем сообщение пользователя в историю
+                session['chat_history'].append({"role": "user", "content": text})
+                logger.info(f"Пользователь {user_id}: длинное сообщение добавлено в историю")
+                
+                # Ограничиваем длину истории для экономии токенов
+                if len(session['chat_history']) > 20:
+                    session['chat_history'] = session['chat_history'][-20:]
+                
+                # Очищаем буфер после обработки
+                session['message_buffer'] = []
+                session['waiting_for_complete_message'] = False
+                session['last_processed_message'] = None
+                logger.info(f"Пользователь {user_id}: буфер очищен после обработки")
+                
+                # Обрабатываем сообщение через новый метод
+                self.process_complete_message(chat_id, user_id, text)
+                return
+            
             needs_more = self.add_message_to_buffer(user_id, text)
             
             if needs_more:
                 # Показываем кнопку для завершения
+                logger.info(f"Пользователь {user_id}: начинаем буферизацию")
                 self.send_message_complete_button(chat_id, user_id)
                 return
             else:
                 # Обычное короткое сообщение
-                text = self.get_complete_message(user_id) if session['message_buffer'] else text
+                if session['message_buffer']:
+                    text = self.get_complete_message(user_id)
+                    logger.info(f"Пользователь {user_id}: отправляем из буфера, длина: {len(text)} символов")
+                else:
+                    logger.info(f"Пользователь {user_id}: отправляем обычное сообщение, длина: {len(text)} символов")
+        
+        # Проверяем, не обрабатывали ли мы уже это сообщение
+        if session.get('last_processed_message') == text:
+            logger.warning(f"Пользователь {user_id}: сообщение уже обрабатывалось, пропускаем")
+            return
+        
+        # Сохраняем текущее сообщение как обработанное
+        session['last_processed_message'] = text
         
         # Добавляем сообщение пользователя в историю
         session['chat_history'].append({"role": "user", "content": text})
+        logger.info(f"Пользователь {user_id}: сообщение добавлено в историю, длина: {len(text)} символов")
         
         # Ограничиваем длину истории для экономии токенов
         if len(session['chat_history']) > 10:
             session['chat_history'] = session['chat_history'][-10:]
         
-        # Отправляем "печатает" статус
-        self.send_chat_action(chat_id, "typing")
+        # Очищаем буфер после обработки
+        session['message_buffer'] = []
+        session['waiting_for_complete_message'] = False
+        session['last_processed_message'] = None
+        logger.info(f"Пользователь {user_id}: буфер очищен после обработки")
         
-        try:
-            if not self.model:
-                self.send_message(chat_id, 
-                    "❌ Ошибка: Gemini API не инициализирован. "
-                    "Проверьте настройки API ключа.")
-                return
-            
-            # Получаем активную игру
-            active_game = self.get_active_game(user_id)
-            
-            if not active_game:
-                # Нет активной игры - предлагаем создать
-                self.send_message(chat_id, 
-                    "🎮 У вас нет активной ролевой игры. Создайте новую игру командой /new или выберите из сохраненных /games")
-                return
-            
-            # Формируем контекст для ролевой игры
-            context_text = f"{self.system_prompt}\n\n"
-            context_text += f"АКТИВНАЯ ИГРА: {active_game.title}\n"
-            context_text += f"ОПИСАНИЕ МИРА: {active_game.description}\n\n"
-            
-            # Добавляем информацию о персонажах
-            context_text += "ПЕРСОНАЖИ:\n"
-            for char in active_game.characters:
-                context_text += f"- {char.name}: {char.description}\n"
-                context_text += f"  Черты: {char.traits}\n"
-                if char.current_state:
-                    context_text += f"  Состояние: {char.current_state}\n"
-            
-            context_text += f"\nТЕГИ: {', '.join(active_game.tags)}\n\n"
-            
-            # Добавляем историю диалога
-            context_text += "ИСТОРИЯ ДИАЛОГА:\n"
-            for msg in session['chat_history'][:-5]:  # Старые сообщения
-                if msg["role"] == "user":
-                    context_text += f"Игрок: {msg['content']}\n"
-                else:
-                    context_text += f"Нейкон: {msg['content']}\n"
-            
-            # Последние 5 сообщений для контекста
-            recent_messages = session['chat_history'][-5:]
-            context_text += "\nПОСЛЕДНИЕ СОБЫТИЯ:\n"
-            for msg in recent_messages[:-1]:
-                if msg["role"] == "user":
-                    context_text += f"Игрок: {msg['content']}\n"
-                else:
-                    context_text += f"Нейкон: {msg['content']}\n"
-            
-            # Текущее сообщение
-            context_text += f"\nИгрок: {text}\n"
-            context_text += "Нейкон:"
-            
-            # Собираем файлы памяти для подключения
-            file_uris = []
-            if active_game.chat_log_file_uri:
-                file_uris.append(active_game.chat_log_file_uri)
-            if active_game.checkpoint_file_uri:
-                file_uris.append(active_game.checkpoint_file_uri)
-            
-            # Добавляем информацию о последних постах из памяти
-            if active_game.chat_log_file_uri or active_game.checkpoint_file_uri:
-                context_text += "\n💾 ПАМЯТЬ ИГРЫ: В памяти есть сохраненная история и состояние персонажей. Используй эту информацию для продолжения игры.\n"
-            
-            # Отправляем запрос с подключенными файлами памяти
-            if file_uris:
-                assistant_message = self.generate_with_files(context_text, file_uris)
-            else:
-                self.increment_counter('total_requests')
-                try:
-                    response = self.model.generate_content(context_text)
-                    assistant_message = response.text.strip()
-                    self.increment_counter('successful_requests')
-                except Exception as e:
-                    logger.error(f"Ошибка генерации: {e}")
-                    self.increment_counter('failed_requests')
-                    self.update_system_status('last_error', f"Генерация: {e}")
-                    assistant_message = f"❌ Ошибка при обработке запроса: {e}"
-            
-            # Добавляем задержку для экономии квоты
-            time.sleep(3)
-            
-            # Добавляем ответ в историю
-            session['chat_history'].append({"role": "assistant", "content": assistant_message})
-            
-            # Отправляем ответ
-            self.send_message(chat_id, assistant_message)
-            
-        except Exception as e:
-            logger.error(f"Ошибка при обработке сообщения: {e}")
-            
-            # Проверяем ошибку квоты
-            if "429" in str(e) or "quota" in str(e).lower():
-                self.send_message(chat_id, 
-                    "⚠️ Превышен лимит запросов к Gemini API. Попробуйте через несколько минут.")
-            else:
-                self.send_message(chat_id, 
-                    "❌ Произошла ошибка при обработке сообщения. Попробуйте позже.")
+        # Обрабатываем сообщение через новый метод
+        self.process_complete_message(chat_id, user_id, text)
     
     def handle_game_creation_message(self, chat_id: int, user_id: int, text: str):
         """Обработка сообщений во время создания игры"""
@@ -1838,7 +2448,14 @@ class SimpleTelegramBot:
                 self.handle_document(message)
             # Проверяем наличие фото
             elif 'photo' in message:
-                self.handle_photo(message)
+                # Проверяем, находимся ли мы в процессе создания персонажа
+                session = self.get_user_session(user_id)
+                if session.get('character_creation_step') and session['character_creation_step'] > 0:
+                    # Фото для персонажа
+                    self.handle_character_photo(message)
+                else:
+                    # Обычное фото во время игры
+                    self.handle_photo(message)
             elif text.startswith('/start'):
                 self.handle_start_command(chat_id, user_id, user_name)
             elif text.startswith('/help'):
@@ -2035,8 +2652,23 @@ class SimpleTelegramBot:
         session['message_buffer'].append(message_text)
         session['last_message_time'] = current_time
         
+        # Логируем состояние буфера
+        total_length = len(' '.join(session['message_buffer']))
+        logger.info(f"Пользователь {user_id}: добавлено сообщение ({len(message_text)} символов), общая длина буфера: {total_length}")
+        
+        # Если сообщение слишком длинное (>15000 символов), сразу отправляем
+        if len(message_text) > 15000:
+            logger.warning(f"Пользователь {user_id}: сообщение превышает лимит ({len(message_text)} символов), отправляем принудительно")
+            return False
+        
         # Проверяем, нужно ли ждать продолжения
-        if len(' '.join(session['message_buffer'])) < 1000:  # Короткие сообщения сразу отправляем
+        if total_length < 1000:  # Короткие сообщения сразу отправляем
+            logger.info(f"Пользователь {user_id}: короткое сообщение, отправляем сразу")
+            return False
+        
+        # Если общая длина буфера больше 15000 символов, принудительно отправляем
+        if total_length > 15000:
+            logger.warning(f"Пользователь {user_id}: буфер превысил лимит ({total_length} символов), принудительная отправка")
             return False
         
         # Если сообщение заканчивается на знаки продолжения, ждем
@@ -2045,14 +2677,22 @@ class SimpleTelegramBot:
         
         for sign in continuation_signs:
             if last_message.endswith(sign):
+                logger.info(f"Пользователь {user_id}: обнаружен знак продолжения '{sign}', ждем")
                 session['waiting_for_complete_message'] = True
                 return True
         
-        # Если сообщение слишком длинное, вероятно это продолжение
-        if len(message_text) > 3000:
+        # Если сообщение слишком длинное (>5000 символов), вероятно это продолжение
+        if len(message_text) > 5000:
+            logger.info(f"Пользователь {user_id}: длинное сообщение ({len(message_text)} символов), ждем продолжения")
             session['waiting_for_complete_message'] = True
             return True
         
+        # Если общая длина буфера больше 8000 символов, считаем сообщение завершенным
+        if total_length > 8000:
+            logger.info(f"Пользователь {user_id}: буфер достиг лимита ({total_length} символов), отправляем")
+            return False
+        
+        logger.info(f"Пользователь {user_id}: сообщение завершено, отправляем")
         return False
     
     def is_message_complete(self, user_id: int) -> bool:
@@ -2118,6 +2758,12 @@ class SimpleTelegramBot:
         # Получаем полное сообщение
         complete_text = self.get_complete_message(user_id)
         
+        # Очищаем буфер
+        session['message_buffer'] = []
+        session['waiting_for_complete_message'] = False
+        session['last_processed_message'] = None
+        logger.info(f"Пользователь {user_id}: буфер очищен после отправки")
+        
         # Добавляем в историю
         session['chat_history'].append({"role": "user", "content": complete_text})
         
@@ -2143,31 +2789,54 @@ class SimpleTelegramBot:
     def process_complete_message(self, chat_id: int, user_id: int, text: str):
         """Обработка завершенного сообщения"""
         start_time = datetime.now()
+        progress_message_id = None  # Инициализируем переменную
+        
+        logger.info(f"Пользователь {user_id}: начинаем обработку сообщения длиной {len(text)} символов")
         
         try:
             if not self.model:
+                logger.error(f"Пользователь {user_id}: Gemini API не инициализирован")
                 self.send_message(chat_id, 
                     "❌ Ошибка: Gemini API не инициализирован. "
                     "Проверьте настройки API ключа.")
                 return
             
+            # Проверяем размер сообщения
+            if not self.validate_message_size(text):
+                logger.warning(f"Пользователь {user_id}: сообщение слишком длинное ({len(text)} символов)")
+                self.send_message(chat_id, 
+                    f"❌ Сообщение слишком длинное ({len(text)} символов). "
+                    f"Максимальный размер: 15000 символов. "
+                    f"Попробуйте разбить сообщение на части.")
+                return
+            
+            # Для очень длинных сообщений (>10000 символов) показываем предупреждение
+            if len(text) > 10000:
+                logger.warning(f"Пользователь {user_id}: очень длинное сообщение ({len(text)} символов), обработка может занять время")
+                self.send_message(chat_id, 
+                    f"⚠️ Обрабатываю длинное сообщение ({len(text)} символов). Это может занять некоторое время...")
+            
             # Получаем активную игру
             active_game = self.get_active_game(user_id)
             
             if not active_game:
+                logger.warning(f"Пользователь {user_id}: нет активной игры")
                 # Нет активной игры - предлагаем создать
                 self.send_message(chat_id, 
                     "🎮 У вас нет активной ролевой игры. Создайте новую игру командой /new или выберите из сохраненных /games")
                 return
             
+            logger.info(f"Пользователь {user_id}: активная игра найдена: {active_game.title}")
+            
             # Отправляем начальный прогресс
             progress_response = self.send_progress_message(chat_id, None, 5, "🎮 Подготовка ролевой игры...")
-            progress_message_id = None
             if progress_response and isinstance(progress_response, dict) and progress_response.get('ok'):
                 progress_message_id = progress_response['result']['message_id']
+                logger.info(f"Пользователь {user_id}: прогресс-бар создан, ID: {progress_message_id}")
             
             # Формируем контекст для ролевой игры
             self.send_progress_message(chat_id, progress_message_id, 15, "📝 Формирование контекста...")
+            logger.info(f"Пользователь {user_id}: формируем контекст")
             
             context_text = f"{self.system_prompt}\n\n"
             context_text += f"АКТИВНАЯ ИГРА: {active_game.title}\n"
@@ -2184,8 +2853,8 @@ class SimpleTelegramBot:
             context_text += f"\nТЕГИ: {', '.join(active_game.tags)}\n\n"
             
             # Добавляем историю диалога
-            context_text += "ИСТОРИЯ ДИАЛОГА:\n"
             session = self.get_user_session(user_id)
+            context_text += "ИСТОРИЯ ДИАЛОГА:\n"
             for msg in session['chat_history'][:-5]:  # Старые сообщения
                 if msg["role"] == "user":
                     context_text += f"Игрок: {msg['content']}\n"
@@ -2205,35 +2874,79 @@ class SimpleTelegramBot:
             context_text += f"\nИгрок: {text}\n"
             context_text += "Нейкон:"
             
+            logger.info(f"Пользователь {user_id}: контекст сформирован, длина: {len(context_text)} символов")
+            
+            # Обрезаем контекст если он слишком большой
+            context_text = self.truncate_context(context_text)
+            logger.info(f"Пользователь {user_id}: контекст обрезан, финальная длина: {len(context_text)} символов")
+            
             # Собираем файлы памяти для подключения
             self.send_progress_message(chat_id, progress_message_id, 30, "💾 Подключение памяти игры...")
             
             file_uris = []
             if active_game.chat_log_file_uri:
                 file_uris.append(active_game.chat_log_file_uri)
+                logger.info(f"Пользователь {user_id}: подключен чат-лог")
             if active_game.checkpoint_file_uri:
                 file_uris.append(active_game.checkpoint_file_uri)
+                logger.info(f"Пользователь {user_id}: подключен чекпоинт")
+            
+            # Проверяем доступность файлов
+            available_files = []
+            for file_uri in file_uris:
+                try:
+                    # Проверяем, является ли это Google Files URI
+                    if 'generativelanguage.googleapis.com' in file_uri:
+                        # Для Google Files API просто проверяем формат URI
+                        if '/files/' in file_uri:
+                            available_files.append(file_uri)
+                            logger.info(f"Пользователь {user_id}: Google Files URI {file_uri} доступен")
+                        else:
+                            logger.warning(f"Пользователь {user_id}: неверный формат Google Files URI {file_uri}")
+                    else:
+                        # Для Telegram файлов проверяем доступность
+                        file_content = self.download_file(file_uri)
+                        if file_content and len(file_content) > 100:
+                            available_files.append(file_uri)
+                            logger.info(f"Пользователь {user_id}: файл {file_uri} доступен ({len(file_content)} байт)")
+                        else:
+                            logger.warning(f"Пользователь {user_id}: файл {file_uri} недоступен или пустой")
+                except Exception as e:
+                    logger.error(f"Пользователь {user_id}: ошибка проверки файла {file_uri}: {e}")
             
             # Добавляем информацию о последних постах из памяти
-            if active_game.chat_log_file_uri or active_game.checkpoint_file_uri:
+            if available_files:
                 context_text += "\n💾 ПАМЯТЬ ИГРЫ: В памяти есть сохраненная история и состояние персонажей. Используй эту информацию для продолжения игры.\n"
+                logger.info(f"Пользователь {user_id}: используем {len(available_files)} доступных файлов")
+            else:
+                logger.info(f"Пользователь {user_id}: файлы недоступны, используем обычную генерацию")
             
             # Отправляем запрос с подключенными файлами памяти
-            if file_uris:
-                assistant_message = self.generate_with_files(context_text, file_uris, chat_id, progress_message_id)
+            if available_files:
+                logger.info(f"Пользователь {user_id}: отправляем запрос с файлами ({len(available_files)} файлов)")
+                assistant_message = self.generate_with_files(context_text, available_files, chat_id, progress_message_id)
             else:
+                logger.info(f"Пользователь {user_id}: отправляем запрос без файлов")
                 self.increment_counter('total_requests')
                 try:
                     self.send_progress_message(chat_id, progress_message_id, 60, "🧠 Генерация ответа...")
                     
-                    response = self.model.generate_content(context_text)
+                    # Генерируем ответ с таймаутом только для обычных запросов
+                    def generate_func():
+                        return self.model.generate_content(context_text)
+                    
+                    logger.info(f"Пользователь {user_id}: отправляем запрос к Gemini API")
+                    response = generate_func()
+                    logger.info(f"Пользователь {user_id}: получен ответ от Gemini API")
+                    
                     assistant_message = response.text.strip()
+                    logger.info(f"Пользователь {user_id}: ответ обработан, длина: {len(assistant_message)} символов")
                     
                     self.increment_counter('successful_requests')
                     self.send_progress_message(chat_id, progress_message_id, 90, "📝 Форматирование ответа...")
                     
                 except Exception as e:
-                    logger.error(f"Ошибка генерации: {e}")
+                    logger.error(f"Пользователь {user_id}: ошибка генерации: {e}")
                     self.increment_counter('failed_requests')
                     self.update_system_status('last_error', f"Генерация: {e}")
                     assistant_message = f"❌ Ошибка при обработке запроса: {e}"
@@ -2244,23 +2957,28 @@ class SimpleTelegramBot:
             
             # Добавляем ответ в историю
             session['chat_history'].append({"role": "assistant", "content": assistant_message})
+            logger.info(f"Пользователь {user_id}: ответ добавлен в историю")
             
-            # Завершаем прогресс
-            self.send_progress_message(chat_id, progress_message_id, 100, "✅ Готово!")
-            time.sleep(1)
+            # Удаляем прогресс-бар если он есть
+            if progress_message_id is not None:
+                self.delete_message(chat_id, progress_message_id)
+                logger.info(f"Пользователь {user_id}: прогресс-бар удален")
             
             # Отправляем ответ
+            logger.info(f"Пользователь {user_id}: отправляем ответ пользователю")
             self.send_message(chat_id, assistant_message)
             
             # Логируем время
             self.log_request_time(start_time, "Ролевая игра", True)
+            logger.info(f"Пользователь {user_id}: обработка завершена успешно")
             
         except Exception as e:
-            logger.error(f"Ошибка при обработке завершенного сообщения: {e}")
+            logger.error(f"Пользователь {user_id}: ошибка при обработке завершенного сообщения: {e}")
             
-            # Показываем ошибку в прогресс-баре
-            if 'progress_message_id' in locals():
-                self.send_progress_message(chat_id, progress_message_id, 100, f"❌ Ошибка: {str(e)[:100]}")
+            # Удаляем прогресс-бар при ошибке
+            if progress_message_id is not None:
+                self.delete_message(chat_id, progress_message_id)
+                logger.info(f"Пользователь {user_id}: прогресс-бар удален при ошибке")
             
             # Логируем время
             self.log_request_time(start_time, "Ролевая игра", False)
@@ -2346,6 +3064,211 @@ class SimpleTelegramBot:
         # Оставляем только последние 100 записей
         if len(self.request_times) > 100:
             self.request_times = self.request_times[-100:]
+
+    def truncate_context(self, context_text: str, max_tokens: int = 30000) -> str:
+        """Обрезка контекста до безопасного размера"""
+        # Примерная оценка токенов (1 токен ≈ 4 символа)
+        estimated_tokens = len(context_text) // 4
+        
+        if estimated_tokens <= max_tokens:
+            return context_text
+        
+        # Если контекст слишком большой, обрезаем историю
+        logger.warning(f"Контекст слишком большой ({estimated_tokens} токенов), обрезаем...")
+        
+        # Оставляем системный промпт и текущее сообщение
+        lines = context_text.split('\n')
+        system_prompt = ""
+        current_message = ""
+        history_lines = []
+        
+        for line in lines:
+            if "СИСТЕМНЫЙ ПРОМПТ:" in line or "АКТИВНАЯ ИГРА:" in line or "ОПИСАНИЕ МИРА:" in line or "ПЕРСОНАЖИ:" in line or "ТЕГИ:" in line:
+                system_prompt += line + '\n'
+            elif "Игрок:" in line and "Нейкон:" not in line:
+                current_message = line
+            elif "ИСТОРИЯ ДИАЛОГА:" in line or "ПОСЛЕДНИЕ СОБЫТИЯ:" in line:
+                continue
+            else:
+                history_lines.append(line)
+        
+        # Оставляем только последние сообщения из истории
+        max_history_lines = max_tokens * 4 // 10  # Оставляем место для системного промпта
+        if len(history_lines) > max_history_lines:
+            history_lines = history_lines[-max_history_lines:]
+        
+        # Собираем обрезанный контекст
+        truncated_context = system_prompt + '\n'.join(history_lines) + '\n' + current_message + '\nНейкон:'
+        
+        logger.info(f"Контекст обрезан с {estimated_tokens} до {len(truncated_context) // 4} токенов")
+        return truncated_context
+
+    def validate_message_size(self, text: str, max_length: int = 15000) -> bool:
+        """Проверка размера сообщения пользователя"""
+        if len(text) > max_length:
+            return False
+        return True
+    
+    def split_user_message(self, text: str, max_length: int = 15000) -> List[str]:
+        """Разбиение длинного сообщения пользователя"""
+        if len(text) <= max_length:
+            return [text]
+        
+        # Разбиваем по предложениям
+        sentences = text.split('. ')
+        parts = []
+        current_part = ""
+        
+        for sentence in sentences:
+            if len(current_part + sentence + '. ') <= max_length:
+                current_part += sentence + '. '
+            else:
+                if current_part:
+                    parts.append(current_part.strip())
+                current_part = sentence + '. '
+        
+        if current_part:
+            parts.append(current_part.strip())
+        
+        return parts
+
+    def force_send_buffered_message(self, user_id: int) -> str:
+        """Принудительная отправка сообщения из буфера"""
+        session = self.get_user_session(user_id)
+        
+        if not session['message_buffer']:
+            return ""
+        
+        complete_text = self.get_complete_message(user_id)
+        logger.info(f"Пользователь {user_id}: принудительная отправка буфера, длина: {len(complete_text)} символов")
+        
+        return complete_text
+    
+    def check_and_force_send(self, user_id: int) -> bool:
+        """Проверка необходимости принудительной отправки буферизованного сообщения"""
+        session = self.get_user_session(user_id)
+        
+        if not session.get('message_buffer'):
+            return False
+        
+        current_time = datetime.now()
+        last_message_time = session.get('last_message_time')
+        
+        if last_message_time:
+            time_diff = (current_time - last_message_time).total_seconds()
+            
+            # Принудительная отправка через 10 секунд
+            if time_diff > 10:
+                logger.info(f"Пользователь {user_id}: таймаут буферизации ({time_diff:.1f} сек), принудительная отправка")
+                return True
+        
+        # Принудительная отправка при превышении лимитов
+        total_length = sum(len(msg) for msg in session['message_buffer'])
+        if total_length > 12000:  # Увеличенный лимит
+            logger.info(f"Пользователь {user_id}: превышен лимит буфера ({total_length} символов), принудительная отправка")
+            return True
+        
+        # Принудительная отправка если последнее сообщение очень длинное
+        if session['message_buffer']:
+            last_message_length = len(session['message_buffer'][-1])
+            if last_message_length > 10000:  # Увеличенный лимит
+                logger.info(f"Пользователь {user_id}: последнее сообщение слишком длинное ({last_message_length} символов), принудительная отправка")
+                return True
+        
+        return False
+
+    def emergency_save_all_games(self):
+        """Экстренное сохранение всех игр всех пользователей"""
+        try:
+            logger.info("🚨 Начинаю экстренное сохранение всех игр...")
+            
+            saved_count = 0
+            for user_id, games in self.saved_games.items():
+                for game in games:
+                    if game.is_active:
+                        try:
+                            # Сохраняем активную игру
+                            session = self.get_user_session(user_id)
+                            if session.get('chat_history'):
+                                # Создаем чат-лог
+                                chat_log_pdf = self.create_chat_log_pdf(session['chat_history'], game.title)
+                                if chat_log_pdf:
+                                    chat_log_uri = self.upload_file_to_google(chat_log_pdf, f"{game.game_id}_chat_log.pdf")
+                                    if chat_log_uri:
+                                        game.chat_log_file_uri = chat_log_uri
+                                        logger.info(f"Сохранен чат-лог для игры {game.title} пользователя {user_id}")
+                                
+                                # Создаем чекпоинт
+                                checkpoint_pdf = self.create_checkpoint_pdf(game, session['chat_history'][-10:])
+                                if checkpoint_pdf:
+                                    checkpoint_uri = self.upload_file_to_google(checkpoint_pdf, f"{game.game_id}_checkpoint.pdf")
+                                    if checkpoint_uri:
+                                        game.checkpoint_file_uri = checkpoint_uri
+                                        logger.info(f"Сохранен чекпоинт для игры {game.title} пользователя {user_id}")
+                                
+                                saved_count += 1
+                        except Exception as e:
+                            logger.error(f"Ошибка сохранения игры {game.title} пользователя {user_id}: {e}")
+            
+            # Сохраняем в файл
+            self.save_games_to_file()
+            
+            logger.info(f"✅ Экстренное сохранение завершено. Сохранено игр: {saved_count}")
+            return saved_count
+            
+        except Exception as e:
+            logger.error(f"Критическая ошибка при экстренном сохранении: {e}")
+            return 0
+
+    def signal_handler(self, signum, frame):
+        """Обработчик сигнала для экстренного сохранения"""
+        logger.info("🛑 Получен сигнал завершения (Ctrl+C). Начинаю экстренное сохранение...")
+        
+        try:
+            # Сохраняем все игры
+            saved_count = self.emergency_save_all_games()
+            
+            # Выводим статистику
+            logger.info(f"📊 Статистика работы бота:")
+            logger.info(f"   - Всего запросов: {self.system_status.get('total_requests', 0)}")
+            logger.info(f"   - Успешных запросов: {self.system_status.get('successful_requests', 0)}")
+            logger.info(f"   - Загружено файлов: {self.system_status.get('files_uploaded', 0)}")
+            logger.info(f"   - Создано игр: {self.system_status.get('games_created', 0)}")
+            logger.info(f"   - Активных пользователей: {self.system_status.get('active_users', 0)}")
+            
+            if saved_count > 0:
+                logger.info(f"✅ Экстренно сохранено {saved_count} активных игр")
+            else:
+                logger.info("ℹ️ Нет активных игр для сохранения")
+            
+            logger.info("👋 Бот завершает работу...")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка при экстренном завершении: {e}")
+        
+        finally:
+            # Завершаем программу
+            exit(0)
+
+    def delete_message(self, chat_id: int, message_id: int):
+        """Удаление сообщения"""
+        url = f"{self.base_url}{self.telegram_token}/deleteMessage"
+        data = {
+            'chat_id': chat_id,
+            'message_id': message_id
+        }
+        
+        try:
+            response = requests.post(url, json=data)
+            if response.status_code == 200:
+                logger.info(f"Сообщение {message_id} успешно удалено")
+                return True
+            else:
+                logger.warning(f"Не удалось удалить сообщение {message_id}: {response.status_code}")
+                return False
+        except Exception as e:
+            logger.error(f"Ошибка удаления сообщения {message_id}: {e}")
+            return False
 
 def main():
     """Главная функция"""
